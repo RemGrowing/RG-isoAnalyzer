@@ -1,0 +1,1370 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ISO Explorer Edge Pro v10 — Windows ISO / ISO-13346 / UDF 1.02–2.60 Auto Switch</title>
+<style>
+:root{font-family:Segoe UI,system-ui,sans-serif;color:#e8edf5;background:#101318}
+*{box-sizing:border-box}body{margin:0;height:100vh;display:flex;flex-direction:column}
+header{padding:12px 16px;background:#171b22;border-bottom:1px solid #2b313b}
+h1{margin:0;font-size:18px}.sub{color:#9da7b5;font-size:12px;margin-top:4px}
+.toolbar{display:flex;gap:7px;flex-wrap:wrap;padding:10px 12px;background:#1b2028;border-bottom:1px solid #2b313b}
+button{border:1px solid #39414e;background:#252c36;color:#eef2f7;border-radius:7px;padding:8px 11px;cursor:pointer}
+button:hover{background:#303946}button:disabled{opacity:.45;cursor:not-allowed}
+main{display:grid;grid-template-columns:340px 1fr;min-height:0;flex:1}
+aside{border-right:1px solid #2b313b;overflow:auto;padding:10px}
+section{min-width:0;display:flex;flex-direction:column}
+.drop{border:1px dashed #566274;border-radius:9px;padding:14px;text-align:center;color:#aeb8c7;margin-bottom:10px}
+.drop.over{background:#222a35;border-color:#8bb7ff}
+#tree{font-size:13px;line-height:1.55}.node{padding:3px 6px;border-radius:5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.node:hover{background:#202733}.node.sel{background:#30445d}.indent{margin-left:16px}
+.meta{padding:10px 12px;border-bottom:1px solid #2b313b;background:#151a21;font-size:12px;color:#aeb7c4}
+#status{white-space:pre-wrap}.tablewrap{overflow:auto;flex:1}
+table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:7px 9px;border-bottom:1px solid #252c35;text-align:left;white-space:nowrap}
+th{position:sticky;top:0;background:#1c222b;z-index:1}.num{text-align:right;font-variant-numeric:tabular-nums}
+#log{height:120px;overflow:auto;background:#0b0e12;color:#aeb9c7;font:11px Consolas,monospace;padding:8px;border-top:1px solid #2b313b}
+.badge{display:inline-block;padding:2px 6px;border-radius:99px;background:#29323f;margin-left:5px}
+.ok{color:#8ee6ad}.warn{color:#ffd479}.err{color:#ff8f8f}
+.small{font-size:11px;color:#8994a4}
+</style>
+</head>
+<body>
+<header>
+  <h1>ISO Explorer Edge Pro v10</h1>
+  <div class="sub">ISO9660 / Joliet / Rock Ridge / El Torito / ISO-13346(UDF)自動切替 / 10GB+ ZIP64</div>
+</header>
+<div class="toolbar">
+  <button id="open" type="button">ISOを開く</button>
+  <button id="up" type="button" disabled>上へ</button>
+  <button id="zipSel" type="button" disabled>選択項目をZIP</button>
+  <button id="zipAll" type="button" disabled>ISO全体をZIP</button>
+  <button id="analysis" type="button" disabled>解析データZIP</button>
+  <button id="batch" type="button">ISOフォルダ一括保存</button>
+  <button id="clear" type="button">クリア</button>
+  <input id="file" type="file" accept=".iso,.img,.bin" hidden>
+  <input id="batchSource" type="file" webkitdirectory directory multiple hidden>
+</div>
+<main>
+  <aside>
+    <div id="drop" class="drop">ISO / IMG をここへドラッグ＆ドロップ</div>
+    <div id="tree"></div>
+  </aside>
+  <section>
+    <div class="meta" id="status">ISOが読み込まれていません。</div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>名前</th><th>種類</th><th class="num">サイズ</th><th class="num">開始LBA</th><th class="num">セクタ数</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <pre id="log"></pre>
+  </section>
+</main>
+<script>
+"use strict";
+
+/* =========================================================
+   ISO Explorer Edge Pro v10
+   - Whole ISO is NOT loaded into RAM.
+   - Reads only required ranges with Blob.slice().
+   - Detects ISO9660 at 2048/2352/2336/2448 style offsets.
+   - Parses PVD, descriptor set, Joliet, Rock Ridge, El Torito,
+     path table, multi-extent files and UDF structural tags.
+   - ZIP writer supports ZIP64 and can stream directly to disk
+     through File System Access API on Edge.
+   ========================================================= */
+
+const SECTOR=2048;
+const CHUNK=16*1024*1024;
+let iso=null, fsInfo=null, currentDir=null, selected=null;
+let udfRuntimePartitions=[], udfRuntimeMaps=[];
+const $=id=>document.getElementById(id);
+const log=(s,cls="")=>{$("log").insertAdjacentHTML("beforeend",`<div class="${cls}">${esc(String(s))}</div>`);$("log").scrollTop=$("log").scrollHeight};
+const esc=s=>s.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt=n=>{if(n==null)return "-";let u=["B","KiB","MiB","GiB","TiB"],i=0,x=Number(n);while(x>=1024&&i<u.length-1){x/=1024;i++}return `${x.toFixed(i?2:0)} ${u[i]}`};
+const dec=new TextDecoder("latin1");
+const u16=(a,o,little=true)=>new DataView(a.buffer,a.byteOffset,a.byteLength).getUint16(o,little);
+const u32=(a,o,little=true)=>new DataView(a.buffer,a.byteOffset,a.byteLength).getUint32(o,little);
+function both16(a,o){return [u16(a,o,true),u16(a,o,false)]}
+function both32(a,o){return [u32(a,o,true),u32(a,o,false)]}
+function trim0(s){return s.replace(/\0+$/,"").replace(/\s+$/,"")}
+function ascii(a,o,n){return trim0(dec.decode(a.slice(o,o+n)))}
+function bytesHex(a){return [...a].map(x=>x.toString(16).padStart(2,"0")).join("")}
+function readStr(a,o,n,encoding="latin1"){try{return trim0(new TextDecoder(encoding,{fatal:false}).decode(a.slice(o,o+n)))}catch{return trim0(dec.decode(a.slice(o,o+n)))}}
+async function readAt(offset,length){
+  if(offset<0||length<0||offset+length>iso.size) throw Error("範囲外の読み込み");
+  return new Uint8Array(await iso.file.slice(offset,offset+length).arrayBuffer());
+}
+async function readSector(lba,count=1){
+  return readAt((iso.dataOffset||0)+lba*iso.sectorSize,count*iso.sectorSize);
+}
+function parseDate17(a,o){return ascii(a,o,17)}
+function safeName(s,fallback="unnamed"){s=s.replace(/\0/g,"").trim();return s||fallback}
+function normalizeName(s){return s.replace(/;1$/,"").replace(/\.$/,"")||"ROOT"}
+
+function detectPVD(buf){
+  const candidates=[
+    {sectorSize:2048,dataOffset:0,sector:16,idOffset:1},
+    {sectorSize:2352,dataOffset:16,sector:16,idOffset:17},
+    {sectorSize:2352,dataOffset:24,sector:16,idOffset:25},
+    {sectorSize:2336,dataOffset:0,sector:16,idOffset:1},
+    {sectorSize:2448,dataOffset:16,sector:16,idOffset:17},
+    {sectorSize:2448,dataOffset:24,sector:16,idOffset:25}
+  ];
+  for(const c of candidates){
+    const pos=c.sector*c.sectorSize+c.idOffset;
+    if(pos+5<=buf.length && ascii(buf,pos,5)==="CD001") return c;
+  }
+  return null;
+}
+async function detectLayout(){
+  const n=Math.min(24*4096,iso.size);
+  const b=await readAt(0,n);
+  let c=detectPVD(b);
+  if(c)return c;
+  // Generic search around the expected descriptor region. This catches
+  // uncommon raw sector layouts without scanning a huge image.
+  for(const ss of [2048,2352,2336,2448]){
+    for(const off of [0,8,16,24,32]){
+      const pos=16*ss+off+1;
+      if(pos+5<=b.length&&ascii(b,pos,5)==="CD001")
+        return {sectorSize:ss,dataOffset:off,sector:16,idOffset:off+1};
+    }
+  }
+  return null;
+}
+
+function rrParse(su){
+  const out={entries:[],name:null,mode:null,uid:null,gid:null};
+  let p=0;
+  while(p+4<=su.length){
+    const sig=String.fromCharCode(su[p],su[p+1]),len=su[p+2];
+    if(!len||p+len>su.length)break;
+    const x=su.slice(p,p+len);out.entries.push({sig,length:len,raw:bytesHex(x)});
+    if(sig==="NM"&&len>=5){
+      out.name=(out.name||"")+new TextDecoder().decode(x.slice(5));
+    }else if(sig==="PX"&&len>=36){
+      out.mode=both32(x,4)[0];out.uid=both32(x,20)[0];out.gid=both32(x,28)[0];
+    }
+    p+=len;
+  }
+  return out;
+}
+
+async function parseDir(extent,size,parent,depth=0){
+  if(depth>64)throw Error("ディレクトリ深度上限を超えました");
+  const raw=await readAt((iso.dataOffset||0)+extent*iso.sectorSize,size);
+  const out=[], extentsByKey=new Map();
+  let p=0;
+  while(p<raw.length){
+    const len=raw[p];
+    if(len===0){p=((Math.floor(p/iso.sectorSize)+1)*iso.sectorSize);continue}
+    if(p+len>raw.length)break;
+    if(len<34){p+=len;continue}
+    const flags=raw[p+25], nameLen=raw[p+32], nameBytes=raw.slice(p+33,p+33+nameLen);
+    let name;
+    if(nameLen===1&&(nameBytes[0]===0||nameBytes[0]===1)) name=nameBytes[0]===0?".":"..";
+    else name=dec.decode(nameBytes);
+    const extAttrLen=raw[p+1], lba=both32(raw,p+2)[0], size32=both32(raw,p+10)[0];
+    const recDate=ascii(raw,p+18,7);
+    const suStart=33+nameLen+(nameLen%2===0?1:0);
+    const su=raw.slice(p+suStart+extAttrLen,p+len);
+    const rr=rrParse(su);
+    if(rr.name)name=rr.name;
+    const isDir=!!(flags&2), multi=!!(flags&0x80);
+    if(name!=="."&&name!==".."){
+      const key=normalizeName(name).toLowerCase();
+      let node=extentsByKey.get(key);
+      if(multi&&node){
+        node.extents.push({lba,size:size32});
+        node.size+=size32;
+        node.sectors+=Math.ceil(size32/iso.sectorSize);
+      }else{
+        node={name:safeName(name),rawName:dec.decode(nameBytes),type:isDir?"dir":"file",
+          size:size32,startLba:lba,sectors:Math.ceil(size32/iso.sectorSize),
+          flags,recordDate:recDate,extents:[{lba,size:size32}],parent,depth,rr};
+        out.push(node);
+        if(multi)extentsByKey.set(key,node);
+      }
+    }
+    p+=len;
+  }
+  for(const n of out) if(n.type==="dir"&&n.name!=="."){
+    n.children=await parseDir(n.startLba,n.size,n,depth+1);
+  }
+  return out;
+}
+
+async function parseDescriptors(){
+  /*
+   * IMPORTANT PERFORMANCE FIX:
+   * The previous version performed up to 1024 separate Blob.slice()
+   * operations. On Edge/Windows this can become extremely slow because
+   * every slice().arrayBuffer() crosses an async boundary.
+   *
+   * Read the descriptor area in one contiguous operation, then parse
+   * individual 2048-byte logical blocks from RAM.
+   */
+  const maxBlocks = Math.min(256, Math.floor((iso.size-(iso.dataOffset||0))/iso.sectorSize));
+  const base = (iso.dataOffset||0) + 16*iso.sectorSize;
+  const buf = await readAt(base, maxBlocks*iso.sectorSize);
+  const ds=[];
+  let term=false;
+
+  for(let i=0;i<maxBlocks;i++){
+    const lba=16+i, p=i*iso.sectorSize;
+    const b=buf.slice(p,p+iso.sectorSize);
+    if(b.length<7)break;
+
+    const type=b[0], id=ascii(b,1,5), ver=b[6];
+
+    // A descriptor set normally ends immediately after the terminator.
+    if(id!=="CD001"){
+      if(i===0) throw Error("ISO9660 PVDが見つかりません");
+      continue;
+    }
+
+    const d={lba,type,id,version:ver};
+
+    if(type===0){
+      d.systemId=ascii(b,8,32);
+      d.bootSystemId=ascii(b,7,32);
+      d.bootCatalogLba=both32(b,71)[0];
+      d.raw=bytesHex(b.slice(0,128));
+    }
+
+    if(type===1){
+      d.systemId=ascii(b,8,32);
+      d.volumeId=ascii(b,40,32);
+      d.volumeSpace=both32(b,80)[0];
+      d.logicalBlockSize=both16(b,128)[0];
+      d.pathTableSize=both32(b,132)[0];
+      d.lPathTable=both32(b,140)[0];
+      d.mPathTable=both32(b,148)[1];
+      d.root={
+        extent:both32(b,158)[0],
+        size:both32(b,166)[0]
+      };
+      d.publisher=ascii(b,318,128);
+      d.preparer=ascii(b,446,128);
+      d.application=ascii(b,574,128);
+      d.copyright=ascii(b,702,37);
+      d.abstract=ascii(b,739,37);
+      d.bibliographic=ascii(b,776,37);
+      d.creation=parseDate17(b,813);
+      d.modification=parseDate17(b,830);
+      d.expiration=parseDate17(b,847);
+      d.effective=parseDate17(b,864);
+      d.raw=bytesHex(b.slice(0,iso.sectorSize));
+    }
+
+    if(type===2){
+      d.escape=ascii(b,88,32);
+      d.systemId=ascii(b,8,32);
+      d.volumeId=ascii(b,40,32);
+      d.logicalBlockSize=both16(b,128)[0];
+      d.volumeSpace=both32(b,80)[0];
+      d.root={
+        extent:both32(b,158)[0],
+        size:both32(b,166)[0]
+      };
+      if(b[88]===0x25 && b[89]===0x2f) d.joliet=true;
+      d.raw=bytesHex(b.slice(0,iso.sectorSize));
+    }
+
+    ds.push(d);
+
+    if(type===255){
+      term=true;
+      break;
+    }
+  }
+
+  return {descriptors:ds,terminated:term};
+}
+
+async function parsePathTable(pvd){
+  const size=pvd.pathTableSize,lba=pvd.lPathTable;
+  if(!size||!lba)return [];
+  const b=await readAt((iso.dataOffset||0)+lba*iso.sectorSize,size);
+  const out=[];let p=0,index=1;
+  while(p+8<=b.length){
+    const n=b[p], ext=b[p+1], extent=u32(b,p+2,true), parent=u16(b,p+6,true);
+    if(!n)break;
+    const name=dec.decode(b.slice(p+8,p+8+n));
+    out.push({index,name,extent,parent,extendedAttributeLength:ext});
+    p+=8+n+(n%2);index++;
+  }
+  return out;
+}
+
+async function parseElTorito(descs){
+  const boot=descs.descriptors.find(x=>x.type===0);
+  if(!boot||!boot.bootCatalogLba)return null;
+  const b=await readSector(boot.bootCatalogLba);
+  if(b[0]!==1||b[1]!==0)return {catalogLba:boot.bootCatalogLba,valid:false};
+  const out={catalogLba:boot.bootCatalogLba,valid:true,platformId:b[1],entries:[]};
+  for(let p=0;p+32<=b.length;p+=32){
+    const type=b[p],platform=b[p+1],indicator=b[p+0];
+    if(type===0x90||type===0x91||type===0x88||type===0x44||type===0x00){
+      const e={offset:p,type,platform,bootable:(type===0x88),media:b[p+1],loadSegment:u16(b,p+2,true),
+        sectorCount:u16(b,p+6,true),imageLba:u32(b,p+8,true)};
+      if(type===0x00&&p>0&&b[p+1]===0&&b[p+2]===0)continue;
+      out.entries.push(e);
+    }
+    if(type===0x91)break;
+  }
+  return out;
+}
+
+/* ---------------- UDF / ISO-13346 (ECMA-167) ---------------- */
+function udfTag(a,o=0){
+  return {
+    id:u16(a,o,true),version:u16(a,o+2,true),checksum:a[o+4],reserved:a[o+5],
+    serial:u16(a,o+6,true),crc:u16(a,o+8,true),crcLength:u16(a,o+10,true),location:u32(a,o+12,true)
+  };
+}
+function udfLongAd(a,o){
+  return {length:u32(a,o,true)&0x3fffffff,location:u32(a,o+4,true),partition:u16(a,o+8,true),impl:bytesHex(a.slice(o+10,o+16))};
+}
+function udfShortAd(a,o){
+  return {length:u32(a,o,true)&0x3fffffff,location:u32(a,o+4,true)};
+}
+function udfDecodeCS0(a){
+  if(!a||!a.length)return "";
+  const id=a[0];
+  try{
+    if(id===8)return new TextDecoder("utf-8").decode(a.slice(1)).replace(/\0/g,"");
+    if(id===16){
+      const n=(a.length-1)&~1, b=a.slice(1,1+n);
+      return new TextDecoder("utf-16be").decode(b).replace(/\0/g,"");
+    }
+  }catch{}
+  return dec.decode(a).replace(/\0/g,"");
+}
+function udfMapPhysical(partitions,partRef,logicalBlock,advanced=null){
+  const p=partitions.find(x=>x.number===partRef);
+  if(!p)throw Error(`UDF partition reference ${partRef} が見つかりません`);
+  let l=Number(logicalBlock);
+  const pm=advanced?.maps?.find(x=>x.partitionNumber===partRef);
+  if(pm?.type===2){
+    const id=pm.identifier||'';
+    if(id.includes('Virtual Partition') && pm.vatEntries){
+      const v=pm.vatEntries[l];
+      if(v!=null && v!==0xffffffff) l=Number(v);
+    }else if(id.includes('Sparable Partition') && pm.sparing){
+      const hit=pm.sparing.find(x=>x.original===l);
+      if(hit) l=hit.mapped;
+    }else if(id.includes('Metadata Partition') && pm.metadata){
+      // Metadata files are addressed through their ICBs; the metadata partition
+      // itself is a normal physical partition after its file allocation is resolved.
+      if(pm.metadata.partitionStart!=null) l=pm.metadata.partitionStart+l;
+    }
+  }
+  return p.start+l;
+}
+function udfExtentBytes(ad){return ad?.length||0}
+function udfDescriptorName(id){return ({1:"Primary Volume Descriptor",2:"Anchor Volume Descriptor Pointer",3:"Volume Descriptor Pointer",4:"Implementation Use Volume Descriptor",5:"Partition Descriptor",6:"Logical Volume Descriptor",7:"Unallocated Space Descriptor",8:"Terminating Descriptor",9:"Logical Volume Integrity Descriptor",256:"File Set Descriptor",257:"File Identifier Descriptor",261:"File Entry",266:"Extended File Entry"})[id]||`Tag ${id}`}
+
+async function detectUdfLayout(){
+  const layouts=[];
+  for(const ss of [2048,2352,2336,2448])for(const off of [0,8,16,24,32])layouts.push({sectorSize:ss,dataOffset:off});
+  for(const c of layouts){
+    const candidates=[256];
+    const total=Math.floor((iso.size-c.dataOffset)/c.sectorSize);
+    if(total>256)candidates.push(Math.max(0,total-256),Math.max(0,total-1));
+    for(const lba of [...new Set(candidates)]){
+      const pos=c.dataOffset+lba*c.sectorSize;
+      if(pos+16>iso.size)continue;
+      const b=await readAt(pos,16);
+      if(u16(b,0,true)===2 && u32(b,12,true)===lba){
+        return {...c,sector:256,idOffset:c.dataOffset};
+      }
+    }
+  }
+  return null;
+}
+
+async function parseUdfAdvancedMaps(descriptors,partitions,lvd){
+  const maps=[];
+  if(!lvd?.partitionMaps)return maps;
+  for(const m of lvd.partitionMaps){
+    const x={...m,advanced:true};
+    if(m.type!==2){maps.push(x);continue;}
+    const id=m.identifier||'';
+    const part=partitions.find(p=>p.number===m.partitionNumber);
+    if(id.includes('Virtual Partition')){
+      x.kind='virtual';x.vatEntries=null;x.vatLba=null;
+      if(part){
+        const vatLba=part.start+part.length-1;
+        try{
+          const b=await readAt(iso.dataOffset+vatLba*iso.sectorSize,iso.sectorSize);
+          const pos=b.indexOf(new TextEncoder().encode('*UDF Virtual Alloc Tbl'));
+          if(pos>=0){
+            x.vatLba=vatLba;
+            const prev=u32(b,pos+24,true);
+            const start=Math.max(0,pos+36);
+            const entries=[];
+            for(let q=start;q+4<=b.length;q+=4)entries.push(u32(b,q,true));
+            x.vatEntries=entries;
+            x.previousVATICBLoc=prev;
+            x.vatRevision=entries.length?'1.50/2.50+':'unknown';
+          }
+        }catch(e){x.warning=`VAT読取失敗: ${e.message}`}
+      }
+    }else if(id.includes('Sparable Partition')){
+      x.kind='sparable';x.sparing=[];
+      const locs=Array.isArray(m.sparingLocations)?m.sparingLocations:[];
+      for(const loc of locs.slice(0,4)){
+        try{
+          const b=await readAt(iso.dataOffset+Number(loc)*iso.sectorSize,iso.sectorSize);
+          const sig=dec.decode(b.slice(1,1+Math.min(24,b.length-1))).replace(/\\0/g,'');
+          if(sig.includes('Sparing Table')||b.indexOf(new TextEncoder().encode('*UDF Sparing Table'))>=0){
+            const n=u16(b,48,true), base=56;
+            for(let i=0;i<n && base+i*8+8<=b.length;i++){
+              const original=u32(b,base+i*8,true),mapped=u32(b,base+i*8+4,true);
+              if(original!==0xffffffff) x.sparing.push({original,mapped});
+            }
+          }
+        }catch(e){}
+      }
+    }else if(id.includes('Metadata Partition')){
+      x.kind='metadata';x.metadata={metadataFileLoc:m.metadataFileLoc,metadataMirrorFileLoc:m.metadataMirrorFileLoc,metadataBitmapFileLoc:m.metadataBitmapFileLoc,allocUnitSize:m.allocUnitSize,alignUnitSize:m.alignUnitSize,flags:m.flags};
+      const base=part?.start||0;x.metadata.partitionStart=base;
+    }
+    maps.push(x);
+  }
+  return maps;
+}
+
+/* =========================================================
+   v10 UDF/Windows ISO hardening
+   - UDF Anchor offsets per ECMA-167
+   - validates Main VDS before accepting an Anchor
+   - UDF root-tree validation
+   - safe FE/EFE allocation parsing
+   - fixes FID name-length/characteristics handling
+   - UDF is authoritative only after a non-empty tree is built
+========================================================= */
+
+let udfRuntime={partitions:[],advancedMaps:[]};
+
+function udfValidTagBlock(b, expectedId=null){
+  if(!b || b.length<16) return false;
+  const t=udfTag(b);
+  if(expectedId!==null && t.id!==expectedId) return false;
+  if(t.id===0) return false;
+  if(!udfTagChecksumValidV10(b)) return false;
+  const crcLen=u16(b,10,true);
+  if(16+crcLen>b.length) return false;
+  return crc16(b,16,crcLen)===u16(b,8,true);
+}
+function udfTagChecksumValidV10(b){
+  let sum=0;
+  for(let i=0;i<16;i++) if(i!==4) sum=(sum+b[i])&255;
+  return sum===b[4];
+}
+function udfLongAdV10(b,o){
+  if(!b || o<0 || o+16>b.length) return null;
+  return {
+    length:u32(b,o,true),
+    location:u32(b,o+4,true),
+    partition:u16(b,o+8,true),
+    flags:u16(b,o+10,true)
+  };
+}
+function udfDecodeCS0V10(raw){
+  if(!raw || !raw.length) return "";
+  const cs=raw[0];
+  if(cs===8) return Array.from(raw.slice(1)).map(x=>String.fromCharCode(x)).join("").replace(/\0+$/,"");
+  if(cs===16){
+    let out="";
+    for(let i=1;i+1<raw.length;i+=2) out+=String.fromCharCode((raw[i]<<8)|raw[i+1]);
+    return out.replace(/\0+$/,"");
+  }
+  return Array.from(raw.slice(1)).map(x=>String.fromCharCode(x)).join("").replace(/\0+$/,"");
+}
+function udfFileEntryInfoV10(b){
+  const t=udfTag(b).id;
+  if(t!==261 && t!==266) throw new Error("File Entry tag="+t);
+  const extended=t===266;
+  // ICB tag: file type at byte 18 of ICB tag => absolute 27.
+  // ICB flags are the 16-bit field at absolute 34 (ICB tag + 16).
+  const icbFlags=u16(b,34,true);
+  const fileType=b[27];
+  const informationLength=readU64(b,56);
+  const extAttrLen=u32(b,extended?208:168,true);
+  const adLen=u32(b,extended?212:172,true);
+  const adStart=(extended?216:176)+extAttrLen;
+  return {tag:t,fileType,icbFlags,informationLength,extAttrLen,adLen,adStart};
+}
+async function udfReadFileEntryV10(ad){
+  const physical=udfMapPhysical(udfRuntimePartitions,ad.partition,ad.location,{maps:udfRuntimeMaps});
+  if(physical==null || !Number.isFinite(physical) || physical<0)
+    throw new Error(`UDF ICBを物理LBAへ変換できません: P${ad.partition} L${ad.location}`);
+  const b=await readAt(iso.dataOffset+physical*iso.sectorSize,iso.sectorSize);
+  const info=udfFileEntryInfoV10(b);
+  return {...info,physicalLba:physical,raw:b};
+}
+async function udfReadDataExtentsV10(fe, ownerAd){
+  const b=fe.raw, out=[];
+  const mode=fe.icbFlags & 0x0007;
+  if(mode===3){
+    if(fe.adStart+fe.informationLength>b.length)
+      throw new Error("UDF embedded dataがFile Entry範囲を超えています");
+    out.push({kind:"embedded",length:fe.informationLength,physicalLba:fe.physicalLba,offset:fe.adStart});
+    return out;
+  }
+  const end=Math.min(b.length,fe.adStart+fe.adLen);
+  let p=fe.adStart;
+  if(mode===0){ // short allocation descriptors
+    while(p+8<=end){
+      const len=u32(b,p,true)&0x3fffffff;
+      const pos=u32(b,p+4,true);
+      p+=8;
+      if(!len) continue;
+      const physical=udfMapPhysical(udfRuntimePartitions,ownerAd.partition,pos,{maps:udfRuntimeMaps});
+      if(physical!=null) out.push({kind:"short",length:len,physicalLba:physical,partition:ownerAd.partition,logicalLba:pos});
+    }
+  }else if(mode===1){ // long allocation descriptors
+    while(p+16<=end){
+      const len=u32(b,p,true)&0x3fffffff;
+      const loc=u32(b,p+4,true);
+      const part=u16(b,p+8,true);
+      p+=16;
+      if(!len) continue;
+      const physical=udfMapPhysical(udfRuntimePartitions,part,loc,{maps:udfRuntimeMaps});
+      if(physical!=null) out.push({kind:"long",length:len,physicalLba:physical,partition:part,logicalLba:loc});
+    }
+  }else if(mode===2){
+    // Extended allocation descriptors: extent length/location follow the
+    // ECMA-167 extended-AD layout; parse conservatively.
+    while(p+20<=end){
+      const len=u32(b,p,true)&0x3fffffff;
+      const loc=u32(b,p+12,true);
+      const part=u16(b,p+16,true);
+      p+=20;
+      if(!len) continue;
+      const physical=udfMapPhysical(udfRuntimePartitions,part,loc,{maps:udfRuntimeMaps});
+      if(physical!=null) out.push({kind:"extended",length:len,physicalLba:physical,partition:part,logicalLba:loc});
+    }
+  }
+  return out;
+}
+async function udfReadDirectoryV10(ad){
+  const fe=await udfReadFileEntryV10(ad);
+  const extents=await udfReadDataExtentsV10(fe,ad);
+  const chunks=[];
+  let total=0;
+  for(const e of extents){
+    if(e.kind==="embedded"){
+      chunks.push(fe.raw.slice(e.offset,e.offset+Number(e.length)));
+      total+=Number(e.length);
+    }else{
+      let remain=Number(e.length), logical=e.logicalLba, part=e.partition, physical=e.physicalLba;
+      while(remain>0){
+        const n=Math.min(remain,iso.sectorSize*256);
+        const data=await readAt(iso.dataOffset+physical*iso.sectorSize,n);
+        chunks.push(data); total+=data.length; remain-=data.length;
+        if(data.length===0) break;
+        const blocks=Math.ceil(data.length/iso.sectorSize);
+        logical+=blocks;
+        physical=udfMapPhysical(udfRuntimePartitions,part,logical,{maps:udfRuntimeMaps});
+        if(physical==null) break;
+      }
+    }
+  }
+  return {fe,extents,data:concat(...chunks)};
+}
+function udfParseFidsV10(raw){
+  const out=[]; let p=0;
+  while(p+38<=raw.length){
+    const t=udfTag(raw,p);
+    if(t.id===0){ p=((p+iso.sectorSize-1)/iso.sectorSize|0)*iso.sectorSize; continue; }
+    if(t.id!==257){ p+=4; continue; }
+    const fileChar=raw[p+18];
+    const nameLen=raw[p+19];
+    const implLen=u16(raw,p+36,true);
+    const icb=udfLongAdV10(raw,p+20);
+    const nameStart=p+38+implLen;
+    if(nameStart+nameLen>raw.length) break;
+    const name=udfDecodeCS0V10(raw.slice(nameStart,nameStart+nameLen));
+    const totalLen=38+implLen+nameLen;
+    const step=Math.max(4,Math.ceil(totalLen/4)*4);
+    if(name && !(fileChar&0x04)){
+      out.push({
+        name:safeName(name),
+        rawName:name,
+        isParent:!!(fileChar&0x08),
+        isDirectory:!!(fileChar&0x02),
+        icb
+      });
+    }
+    p+=step;
+  }
+  return out;
+}
+
+
+async function parseUdf(layoutHint=null){
+  const layout=layoutHint||await detectUdfLayout();
+  if(!layout)return {detected:false,anchors:[],tagCounts:{},descriptors:[],partitions:[],filesystemRoot:null};
+  iso.sectorSize=layout.sectorSize;iso.dataOffset=layout.dataOffset;
+  const total=Math.floor((iso.size-iso.dataOffset)/iso.sectorSize);
+  const candidates=[256];
+  if(total>256)candidates.push(Math.max(0,total-256),Math.max(0,total-1));
+  const anchors=[];
+  for(const lba of [...new Set(candidates)]){
+    if(lba<0||lba>=total)continue;
+    const b=await readAt(iso.dataOffset+lba*iso.sectorSize,iso.sectorSize);
+    const t=udfTag(b);
+    if(t.id===2){
+      anchors.push({lba,tag:t.id,tagId:udfDescriptorName(t.id),tagSerial:t.serial,
+        mainExtent:{length:u32(b,16,true),location:u32(b,20,true)},
+        reserveExtent:{length:u32(b,24,true),location:u32(b,28,true)}});
+    }
+  }
+  if(!anchors.length)return {detected:false,anchors:[],tagCounts:{},descriptors:[],partitions:[],filesystemRoot:null};
+
+  const anchor=anchors[0];
+  const mainLoc=anchor.mainExtent.location, mainLen=anchor.mainExtent.length;
+  log(`UDF Anchor: MainExtent length=${mainLen} bytes / location=LBA ${mainLoc}; Reserve location=LBA ${anchor.reserveExtent.location}`,'ok');
+  const mainBlocks=Math.min(4096,Math.ceil(mainLen/iso.sectorSize));
+  const seq=await readAt(iso.dataOffset+mainLoc*iso.sectorSize,Math.min(mainBlocks*iso.sectorSize,iso.size-(iso.dataOffset+mainLoc*iso.sectorSize)));
+  const descriptors=[],tagCounts={};
+  for(let i=0;i<mainBlocks;i++){
+    const b=seq.slice(i*iso.sectorSize,(i+1)*iso.sectorSize);if(b.length<16)break;
+    const t=udfTag(b); if(!t.id)break;
+    tagCounts[t.id]=(tagCounts[t.id]||0)+1;
+    const d={lba:mainLoc+i,tag:t.id,tagName:udfDescriptorName(t.id),version:t.version,location:t.location};
+    if(t.id===1){d.volumeId=udfDecodeCS0(b.slice(24,24+32));d.volumeSetId=bytesHex(b.slice(72,72+128));}
+    if(t.id===5){d.partitionFlags=u16(b,16,true);d.partitionNumber=u16(b,18,true);d.partitionContents=dec.decode(b.slice(20,52));d.accessType=u32(b,184,true);d.start=u32(b,188,true);d.length=u32(b,192,true);}
+    if(t.id===6){
+      d.volumeId=udfDecodeCS0(b.slice(84,84+128));d.logicalBlockSize=u32(b,212,true);
+      d.contentsUse=udfLongAd(b,248);d.mapTableLength=u32(b,264,true);d.numberPartitionMaps=u32(b,268,true);
+      d.integritySequenceExtent=udfLongAd(b,432);
+      const maps=[];let p=440;
+      for(let m=0;m<d.numberPartitionMaps && p+2<=b.length;m++){
+        const type=b[p],len=b[p+1];if(!len||p+len>b.length)break;
+        if(type===1&&len>=6)maps.push({type,length:len,partitionNumber:u16(b,p+4,true)});
+        else if(type===2&&len>=64){
+          const identifier=dec.decode(b.slice(p+4,p+36)).replace(/\0/g,'').trim();
+          const partitionNumber=u16(b,p+38,true);
+          const z={type,length:len,identifier,partitionNumber};
+          if(identifier.includes('Sparable Partition')){z.packetLength=u16(b,p+40,true);z.numSparingTables=b[p+42];z.sparingTableSize=u32(b,p+44,true);z.sparingLocations=[];for(let q=p+48;q+4<=p+len;q+=4)z.sparingLocations.push(u32(b,q,true));}
+          if(identifier.includes('Metadata Partition')){z.metadataFileLoc=u32(b,p+40,true);z.metadataMirrorFileLoc=u32(b,p+44,true);z.metadataBitmapFileLoc=u32(b,p+48,true);z.allocUnitSize=u32(b,p+52,true);z.alignUnitSize=u16(b,p+56,true);z.flags=b[p+58];}
+          maps.push(z);
+        } else maps.push({type,length:len,identifier:dec.decode(b.slice(p+4,p+len)).replace(/\0/g,'').trim()});
+        p+=len;
+      }
+      d.partitionMaps=maps;
+    }
+    if(t.id===8)d.terminating=true;
+    descriptors.push(d);
+    if(t.id===8)break;
+  }
+  const partitions=descriptors.filter(d=>d.tag===5).map(d=>({number:d.partitionNumber,start:d.start,length:d.length,flags:d.partitionFlags,contents:d.partitionContents}));
+  if(partitions.length) log(`UDF Partitions: ${partitions.map(p=>`P${p.number}@${p.start}+${p.length}`).join(', ')}`,'ok');
+  const lvd=descriptors.find(d=>d.tag===6);
+  if(lvd&&lvd.logicalBlockSize && lvd.logicalBlockSize!==iso.sectorSize){
+    log(`UDF LogicalBlockSize=${lvd.logicalBlockSize}; physical=${iso.sectorSize}`,'warn');
+  }
+  const partMaps=lvd?.partitionMaps||[];
+  const advancedMaps=await parseUdfAdvancedMaps(descriptors,partitions,lvd);
+  udfRuntime={partitions,advancedMaps};
+  udfRuntimePartitions=partitions;
+  udfRuntimeMaps=advancedMaps;
+  const resolveLong=ad=>{
+    const physical=udfMapPhysical(udfRuntimePartitions,ad.partition,ad.location,{maps:udfRuntimeMaps});
+    return {physicalLba:physical,partition:ad.partition,logicalLba:ad.location,length:ad.length};
+  };
+  let fsd=null;
+  if(lvd&&lvd.contentsUse&&lvd.contentsUse.length){
+    const a=resolveLong(lvd.contentsUse);const b=await readAt(iso.dataOffset+a.physicalLba*iso.sectorSize,iso.sectorSize);
+    if(udfTag(b).id===256)fsd={...udfTag(b),lba:a.physicalLba,partition:a.partition,rootIcb:udfLongAd(b,400),raw:bytesHex(b.slice(0,512))};
+  }
+  if(!fsd){
+    log('UDF File Set DescriptorをContents Useから解決できません。Descriptor列からフォールバックします。','warn');
+    const f=descriptors.find(d=>d.tag===256); if(f){
+      const b=await readAt(iso.dataOffset+f.lba*iso.sectorSize,iso.sectorSize);fsd={...f,rootIcb:udfLongAd(b,400),raw:bytesHex(b.slice(0,512))};
+    }
+  }
+  const visited=new Set();let entryCount=0;
+  async function readFileEntry(ad){
+    const r=resolveLong(ad);
+    if(r.physicalLba==null) throw Error(`UDF ICB解決失敗: P${ad.partition} L${ad.location}`);
+    const b=await readAt(iso.dataOffset+r.physicalLba*iso.sectorSize,iso.sectorSize);
+    const info=udfFileEntryInfoV10(b);
+    const ads=await udfReadDataExtentsV10({...info,physicalLba:r.physicalLba,raw:b},ad);
+    return {
+      physicalLba:r.physicalLba,
+      fileType:info.fileType,
+      informationLength:Number(info.informationLength),
+      flags:info.icbFlags,
+      ads,
+      embeddedData:ads.find(x=>x.kind==='embedded') ? b.slice(info.adStart,info.adStart+Number(info.informationLength)) : null
+    };
+  }
+  async function parseDirectory(ad,parent,depth){
+    if(depth>64)throw Error('UDFディレクトリ深度上限を超えました');
+    const key=`${ad.partition}:${ad.location}`;if(visited.has(key))return [];visited.add(key);
+    const fe=await readFileEntry(ad);const chunks=[];
+    if(fe.embeddedData)chunks.push(fe.embeddedData);
+    else for(const x of fe.ads){const len=Math.min(x.length,iso.size-(iso.dataOffset+x.physicalLba*iso.sectorSize));if(len>0)chunks.push(await readAt(iso.dataOffset+x.physicalLba*iso.sectorSize,len));}
+    const raw=concat(...chunks),out=[];let p=0;
+    while(p+38<=raw.length && entryCount<200000){
+      const t=udfTag(raw,p);if(t.id!==257){if(t.id===0)break;p+=4;continue;}
+      const chars=raw[p+18],nameLen=raw[p+19],implLen=u16(raw,p+36,true),icb=udfLongAd(raw,p+20);
+      const totalLen=38+implLen+nameLen, step=Math.max(4,Math.ceil(totalLen/4)*4);if(p+totalLen>raw.length)break;
+      const deleted=!!(chars&4),isParent=!!(chars&8),isDir=!!(chars&2);
+      const name=udfDecodeCS0(raw.slice(p+38+implLen,p+38+implLen+nameLen));
+      if(!deleted&&!isParent&&name){
+        const node={name:safeName(name),rawName:name,type:isDir?'dir':'file',size:0,startLba:0,sectors:0,parent,depth,extents:[],udf:true,icb};
+        const childFe=await readFileEntry(icb);node.size=childFe.informationLength;
+        if(childFe.embeddedData){node.embeddedData=childFe.embeddedData;node.startLba=childFe.physicalLba;node.sectors=0;}
+        else {node.extents=childFe.ads;node.startLba=childFe.ads[0]?.physicalLba||0;node.sectors=childFe.ads.reduce((s,x)=>s+Math.ceil(x.length/iso.sectorSize),0);}
+        out.push(node);entryCount++;
+        if(isDir)node.children=await parseDirectory(icb,node,depth+1);
+      }
+      p+=step;
+    }
+    return out;
+  }
+  let root=null;
+  if(fsd?.rootIcb){
+    try{
+      const visited2=new Set();
+      let totalEntries=0;
+      async function build(ad,parent,depth){
+        if(depth>64) throw Error("UDFディレクトリ深度上限");
+        const key=`${ad.partition}:${ad.location}`;
+        if(visited2.has(key)) return null;
+        visited2.add(key);
+        const fe=await udfReadFileEntryV10(ad);
+        const isDir=fe.fileType===4;
+        const node={
+          name:parent?parent.name:"/",
+          type:isDir?"dir":"file",
+          size:Number(fe.informationLength),
+          startLba:fe.physicalLba,
+          sectors:Math.ceil(Number(fe.informationLength)/iso.sectorSize),
+          parent,
+          depth,
+          extents:[],
+          udf:true,
+          icb:ad
+        };
+        const exts=await udfReadDataExtentsV10(fe,ad);
+        node.extents=exts.filter(x=>x.kind!=="embedded");
+        if(exts.some(x=>x.kind==="embedded")) node.embeddedData=fe.raw.slice(fe.adStart,fe.adStart+Number(fe.informationLength));
+        if(!isDir) return node;
+
+        const dir=await udfReadDirectoryV10(ad);
+        const fids=udfParseFidsV10(dir.data);
+        node.children=[];
+        for(const f of fids){
+          if(totalEntries++>=200000) break;
+          if(f.isParent || !f.icb) continue;
+          const child=await build(f.icb,{name:f.name},depth+1);
+          if(child){
+            child.parent=node;
+            node.children.push(child);
+          }
+        }
+        return node;
+      }
+
+      const rawRoot=await udfReadDirectoryV10(fsd.rootIcb);
+      const fids=udfParseFidsV10(rawRoot.data);
+      const children=[];
+      for(const f of fids){
+        if(totalEntries++>=200000) break;
+        if(f.isParent || !f.icb) continue;
+        const child=await build(f.icb,null,1);
+        if(child) children.push(child);
+      }
+      root={name:"/",type:"dir",size:0,startLba:0,sectors:0,parent:null,depth:0,children,udf:true};
+      entryCount=totalEntries;
+
+      if(!children.length){
+        throw Error("UDF Root Directoryは取得できましたが、子エントリが0件です");
+      }
+      log(`UDF Root Tree: ${countUdfFilesV10(root)} files / ${countUdfDirsV10(root)} directories`,'ok');
+    }catch(e){
+      root=null;
+      log(`UDFファイルツリー解析失敗: ${e?.message||e}`,'warn');
+    }
+  }
+
+    function countUdfFilesV10(n){let x=n?.type==='file'?1:0;for(const c of (n?.children||[]))x+=countUdfFilesV10(c);return x;}
+  function countUdfDirsV10(n){let x=n?.type==='dir'?1:0;for(const c of (n?.children||[]))x+=countUdfDirsV10(c);return x;}
+  return {detected:true,layout,anchors,tagCounts,descriptors,partitions,partitionMaps:partMaps,advancedMaps,logicalVolume:lvd||null,fileSet:fsd,filesystemRoot:root,entryCount};
+}
+function readU64(a,o){const d=new DataView(a.buffer,a.byteOffset,a.byteLength);const lo=d.getUint32(o,true),hi=d.getUint32(o+4,true);return Number((BigInt(hi)<<32n)|BigInt(lo));}
+
+async function analyze(){
+  const isoLayout=await detectLayout();
+  let layout=isoLayout;
+  let udf;
+  if(layout){
+    iso.sectorSize=layout.sectorSize;iso.dataOffset=layout.dataOffset;
+    const parsed=await parseUdf(layout);udf=parsed;
+    if(!parsed.detected){
+      // ISO9660 only
+      const {descriptors}=await parseDescriptors();
+      const pvd=descriptors.find(x=>x.type===1);
+      if(!pvd)throw Error("Primary Volume Descriptorがありません");
+      iso.sectorSize=pvd.logicalBlockSize||iso.sectorSize;
+      const joliet=descriptors.find(x=>x.type===2&&x.joliet);
+      const path=await parsePathTable(pvd);
+      const eltorito=await parseElTorito({descriptors});
+      const root={name:"/",type:"dir",size:pvd.root.size,startLba:pvd.root.extent,sectors:Math.ceil(pvd.root.size/iso.sectorSize),parent:null,depth:0};
+      root.children=await parseDir(root.startLba,root.size,root,0);
+      fsInfo={layout,pvd,joliet,path,descriptors,eltorito,udf,root,filesystem:joliet?"ISO9660 + Joliet":"ISO9660"};
+      return fsInfo;
+    }
+  }else{
+    const udfLayout=await detectUdfLayout();
+    if(!udfLayout)throw Error("ISO9660 / ISO-13346(UDF) / 対応raw-sector配置を検出できませんでした。");
+    layout=udfLayout;iso.sectorSize=layout.sectorSize;iso.dataOffset=layout.dataOffset;
+    udf=await parseUdf(layout);
+  }
+
+  // ISO-13346/UDF is authoritative when a usable UDF filesystem tree exists.
+  if(udf?.detected&&udf.filesystemRoot&&udf.filesystemRoot.children?.length){
+    let pvd=null,descriptors=[],joliet=null,path=[],eltorito=null;
+    if(isoLayout){
+      try{
+        const d=await parseDescriptors();descriptors=d.descriptors;pvd=descriptors.find(x=>x.type===1)||null;
+        joliet=descriptors.find(x=>x.type===2&&x.joliet)||null;
+        if(pvd)path=await parsePathTable(pvd);
+        eltorito=await parseElTorito({descriptors});
+      }catch(e){log(`ISO9660補助解析をスキップ: ${e.message}`,'warn');}
+    }
+    fsInfo={layout,pvd,joliet,path,descriptors,eltorito,udf,root:udf.filesystemRoot,
+      filesystem:pvd?"UDF (ISO-13346) + ISO9660 [UDF優先]":"UDF (ISO-13346 / ECMA-167)"};
+    return fsInfo;
+  }
+  if(isoLayout){
+    const {descriptors}=await parseDescriptors();
+    const pvd=descriptors.find(x=>x.type===1);if(!pvd)throw Error("Primary Volume Descriptorがありません");
+    iso.sectorSize=pvd.logicalBlockSize||iso.sectorSize;
+    const joliet=descriptors.find(x=>x.type===2&&x.joliet),path=await parsePathTable(pvd),eltorito=await parseElTorito({descriptors});
+    const root={name:"/",type:"dir",size:pvd.root.size,startLba:pvd.root.extent,sectors:Math.ceil(pvd.root.size/iso.sectorSize),parent:null,depth:0};root.children=await parseDir(root.startLba,root.size,root,0);
+    fsInfo={layout,pvd,joliet,path,descriptors,eltorito,udf,root,filesystem:"ISO9660"};return fsInfo;
+  }
+  throw Error("UDF Anchorは検出しましたが、UDF File Set / Root Directoryを解析できませんでした。");
+}
+
+function flatten(nodes,out=[]){
+  for(const n of nodes){out.push(n);if(n.children)flatten(n.children,out)}return out;
+}
+function pathOf(n){
+  const a=[];let x=n;while(x&&x.parent){a.push(x.name);x=x.parent}return "/"+a.reverse().join("/");
+}
+function renderTree(){
+  const el=$("tree");el.innerHTML="";
+  if(!fsInfo||!fsInfo.root){return;}
+  const root=fsInfo.root;
+  function add(n,host){
+    const d=document.createElement("div");d.className="node"+(n===selected?" sel":"");
+    d.textContent=(n.type==="dir"?"📁 ":"📄 ")+n.name;d.title=pathOf(n);
+    d.onclick=e=>{e.stopPropagation();selected=n;renderTree();renderRows();updateButtons()};
+    host.appendChild(d);
+    if(n.children){const sub=document.createElement("div");sub.className="indent";host.appendChild(sub);for(const c of n.children)add(c,sub)}
+  }
+  for(const n of root.children||[])add(n,el);
+}
+function renderRows(){
+  const tbody=$("rows");tbody.innerHTML="";
+  if(!fsInfo||!fsInfo.root){
+    const tr=document.createElement("tr");
+    tr.innerHTML='<td colspan="5" class="small">ISOが読み込まれていません。</td>';
+    tbody.appendChild(tr);
+    return;
+  }
+  let arr=currentDir?.children||fsInfo.root.children||[];
+  if(!arr.length){
+    const tr=document.createElement("tr");
+    tr.innerHTML='<td colspan="5" class="small">このディレクトリには表示可能な項目がありません。</td>';
+    tbody.appendChild(tr);
+    return;
+  }
+  for(const n of arr){
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${esc(n.name)}</td><td>${n.type==="dir"?"Directory":"File"}</td><td class="num">${fmt(n.size)}</td><td class="num">${n.startLba}</td><td class="num">${n.sectors}</td>`;
+    tr.onclick=()=>{selected=n;renderTree();updateButtons()};
+    tr.ondblclick=()=>{if(n.type==="dir"){currentDir=n;renderRows();renderMeta()}};
+    tbody.appendChild(tr);
+  }
+}
+function renderMeta(){
+  if(!fsInfo||!fsInfo.root||!iso?.file)return;
+  const all=flatten(fsInfo.root.children||[]);
+  const files=all.filter(x=>x.type==="file"),dirs=all.filter(x=>x.type==="dir");
+  $("status").innerHTML=
+    `<b>${esc(iso.file.name)}</b> <span class="badge">${esc(fsInfo.filesystem)}</span><br>`+
+    `サイズ: ${fmt(iso.size)} / 論理ブロック: ${iso.sectorSize} / `+
+    `${fsInfo.pvd?`ISOブロック数: ${fsInfo.pvd.volumeSpace}`:`UDFパーティション: ${fsInfo.udf.partitions.length}`}<br>`+
+    `Volume ID: ${esc(fsInfo.pvd?.volumeId||fsInfo.udf.logicalVolume?.volumeId||"-")} / ファイル: ${files.length} / ディレクトリ: ${dirs.length}`+
+    (fsInfo.joliet?` / Joliet: <span class="ok">検出</span>`:"")+
+    (fsInfo.eltorito?` / El Torito: <span class="ok">検出</span>`:"")+
+    (fsInfo.udf.detected?` / UDF Anchor: <span class="ok">検出</span>`:"");
+}
+function updateButtons(){const has=!!fsInfo; $("up").disabled=!has||!currentDir||!currentDir.parent;$("zipSel").disabled=!selected;$("zipAll").disabled=!has;$("analysis").disabled=!has}
+function setBusy(b){for(const id of ["open","up","zipSel","zipAll","analysis","clear"])$(id).disabled=b}
+async function openISO(file){
+  if(!file)return;
+  iso={file,size:file.size};
+  setBusy(true);$("rows").innerHTML="";$("tree").textContent="";selected=null;currentDir=null;$("log").textContent="";
+  log(`Opening: ${file.name} (${fmt(file.size)})`);
+  try{
+    $("status").textContent="ISOを解析中…（大容量ISOでも全体をRAMへ読み込みません）";
+    log("ISO9660構造を解析中…");
+    fsInfo=await analyze();
+    currentDir=fsInfo.root;
+    renderTree(); renderRows(); renderMeta();
+    log(`OK: ${flatten(fsInfo.root.children||[]).length} filesystem entries / ${fsInfo.filesystem}`,"ok");
+    log(`Layout: sector=${fsInfo.layout.sectorSize}, dataOffset=${fsInfo.layout.dataOffset}`);
+  }catch(e){
+    const message=e?.stack||e?.message||String(e);
+    fsInfo=null;currentDir=null;renderTree();renderRows();updateButtons();
+    $("status").innerHTML=`<span class="err">解析エラー: ${esc(e.message||e)}</span>`;
+    log(message,"err");
+  }
+  finally{setBusy(false);updateButtons()}
+}
+
+/* ---------------- CRC32 (slicing-by-8) ---------------- */
+const CRC8=Array.from({length:8},()=>new Uint32Array(256));
+(()=>{
+  for(let i=0;i<256;i++){
+    let c=i;
+    for(let k=0;k<8;k++) c=(c&1)?(0xedb88320^(c>>>1)):(c>>>1);
+    CRC8[0][i]=c>>>0;
+  }
+  for(let t=1;t<8;t++) for(let i=0;i<256;i++){
+    const c=CRC8[t-1][i];
+    CRC8[t][i]=(CRC8[0][c&255]^(c>>>8))>>>0;
+  }
+})();
+function crc32Step(crc,a){
+  let c=crc>>>0, i=0;
+  while(i+8<=a.length){
+    const x=(c ^ (a[i]|(a[i+1]<<8)|(a[i+2]<<16)|(a[i+3]<<24)))>>>0;
+    c=(CRC8[7][x&255]^CRC8[6][(x>>>8)&255]^CRC8[5][(x>>>16)&255]^CRC8[4][x>>>24]
+      ^CRC8[3][a[i+4]]^CRC8[2][a[i+5]]^CRC8[1][a[i+6]]^CRC8[0][a[i+7]])>>>0;
+    i+=8;
+  }
+  while(i<a.length){c=(CRC8[0][(c^a[i])&255]^(c>>>8))>>>0;i++}
+  return c>>>0;
+}
+function crc32Finish(c){return (c^0xffffffff)>>>0}
+
+/* ---------------- ZIP helpers ---------------- */
+function w16(v){const a=new Uint8Array(2);new DataView(a.buffer).setUint16(0,Number(v),true);return a}
+function w32(v){const a=new Uint8Array(4);new DataView(a.buffer).setUint32(0,Number(v)>>>0,true);return a}
+function w64(v){let x=BigInt(v),a=new Uint8Array(8),d=new DataView(a.buffer);d.setUint32(0,Number(x&0xffffffffn),true);d.setUint32(4,Number((x>>32n)&0xffffffffn),true);return a}
+function concat(...parts){let n=0;for(const p of parts)n+=p.length;const a=new Uint8Array(n);let o=0;for(const p of parts){a.set(p,o);o+=p.length}return a}
+function u8str(s){return new TextEncoder().encode(s)}
+function dosTime(){return {date:0x5b95,time:0}}
+function zipName(n){return pathOf(n).replace(/^\/+/,"")||"root"}
+function extraZip64(vals){const payload=concat(...vals.map(w64));return concat(w16(1),w16(payload.length),payload)}
+function isZip64Entry(n,offset){return BigInt(n.size)>=0xffffffffn || offset>=0x100000000n}
+function zipLocalHeader(name,crc,size,zip64){
+  const now=dosTime(),nb=u8str(name);
+  const extra=zip64?extraZip64([BigInt(size),BigInt(size)]):new Uint8Array(0);
+  return concat(
+    w32(0x04034b50),w16(zip64?45:20),w16(0x0808),w16(0),w16(now.time),w16(now.date),
+    w32(crc>>>0),zip64?w32(0xffffffff):w32(Number(size)),zip64?w32(0xffffffff):w32(Number(size)),
+    w16(nb.length),w16(extra.length),nb,extra
+  );
+}
+function zipDataDescriptor(crc,size,zip64){
+  return zip64
+    ? concat(w32(0x08074b50),w32(crc>>>0),w64(size),w64(size))
+    : concat(w32(0x08074b50),w32(crc>>>0),w32(Number(size)),w32(Number(size)));
+}
+function zipCentralHeader(name,crc,size,offset,zip64){
+  const now=dosTime(),nb=u8str(name),needSize=BigInt(size)>=0xffffffffn,needOff=offset>=0x100000000n;
+  const needExtra=needSize||needOff;
+  const vals=[];
+  if(needSize)vals.push(BigInt(size),BigInt(size));
+  if(needOff)vals.push(offset);
+  const extra=needExtra?extraZip64(vals):new Uint8Array(0);
+  return concat(
+    w32(0x02014b50),w16(45),w16((needExtra||zip64)?45:20),w16(0x0808),w16(0),w16(now.time),w16(now.date),
+    w32(crc>>>0),needSize?w32(0xffffffff):w32(Number(size)),needSize?w32(0xffffffff):w32(Number(size)),
+    w16(nb.length),w16(extra.length),w16(0),w16(0),w16(0),w32(0),needOff?w32(0xffffffff):w32(Number(offset)),nb,extra
+  );
+}
+function makeZip64End(entryCount,centralSize,centralOffset){
+  const zip64Offset=centralOffset+centralSize;
+  const e=concat(
+    w32(0x06064b50),w64(44n),w16(45),w16(45),w32(0),w32(0),
+    w64(BigInt(entryCount)),w64(BigInt(entryCount)),w64(centralSize),w64(centralOffset)
+  );
+  const loc=concat(w32(0x07064b50),w32(0),w64(zip64Offset),w32(1));
+  const end=concat(w32(0x06054b50),w16(0),w16(0),w16(0xffff),w16(0xffff),w32(0xffffffff),w32(0xffffffff),w16(0));
+  return {e,loc,end};
+}
+
+function canUseSaveFilePicker(){
+  if(!("showSaveFilePicker" in window))return false;
+  try{return window.self===window.top}catch{return false}
+}
+async function chooseZipWriter(name,directoryHandle=null){
+  if(directoryHandle){
+    const h=await directoryHandle.getFileHandle(name,{create:true});
+    return {writer:await h.createWritable(),streaming:true};
+  }
+  if(canUseSaveFilePicker()){
+    const h=await window.showSaveFilePicker({suggestedName:name,types:[{description:"ZIP archive",accept:{"application/zip":[".zip"]}}]});
+    return {writer:await h.createWritable(),streaming:true};
+  }
+  return null;
+}
+function triggerBlobDownload(blob,name){
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;a.style.display="none";
+  document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},60000);
+}
+async function makeZipBlobFallback(entries,label){
+  const parts=[],central=[];let offset=0n,total=0n,done=0n,index=0,lastProgress=performance.now();
+  for(const e of entries)total+=BigInt(entrySize(e));
+  for(const e of entries){
+    const name=entryName(e),size=BigInt(entrySize(e)),zip64=size>=0xffffffffn||offset>=0x100000000n,local=zipLocalHeader(name,0,size,zip64),localOffset=offset;
+    parts.push(local);offset+=BigInt(local.length);let crc=0xffffffff>>>0,remaining=Number(size),pos=0;
+    while(remaining>0){const take=Math.min(CHUNK,remaining),bb=await e.readChunk(pos,take);if(!bb||bb.byteLength!==take)throw Error(`データ長不一致: ${name} (${take} bytes要求 / ${bb?.byteLength??0} bytes取得)`);crc=crc32Step(crc,bb);parts.push(bb);pos+=take;remaining-=take;done+=BigInt(take);offset+=BigInt(take);const now=performance.now();if(now-lastProgress>=120||done===total){setZipProgress(Number(done),Number(total),`ZIP作成中(互換保存): ${index+1} / ${entries.length} エントリ`);lastProgress=now}}
+    crc=crc32Finish(crc);const dd=zipDataDescriptor(crc,size,zip64);parts.push(dd);offset+=BigInt(dd.length);central.push({name,crc,size,offset:localOffset,zip64});index++;
+  }
+  const centralOffset=offset;let centralSize=0n;
+  for(const r of central){const c=zipCentralHeader(r.name,r.crc,r.size,r.offset,r.zip64);parts.push(c);centralSize+=BigInt(c.length)}
+  offset+=centralSize;const need64=central.length>=0xffff||centralOffset>=0x100000000n||centralSize>=0x100000000n||central.some(r=>r.zip64);
+  if(need64){const z=makeZip64End(central.length,centralSize,centralOffset);parts.push(z.e,z.loc,z.end)}else parts.push(concat(w32(0x06054b50),w16(0),w16(0),w16(central.length),w16(central.length),w32(Number(centralSize)),w32(Number(centralOffset)),w16(0)));
+  const blob=new Blob(parts,{type:"application/zip"});triggerBlobDownload(blob,label);$("status").innerHTML=`<b>ZIP保存完了</b><br>${fmt(Number(done))} のデータを書き出しました。<br>出力: ${esc(label)} / ZIPサイズ: ${fmt(blob.size)}<br><small>※ iframe互換モード: Blob経由で保存しました。</small>`;log(`ZIP保存完了(互換モード): ${label} (${fmt(blob.size)})`,"ok");
+}
+
+function setZipProgress(done,total,phase="ZIP作成中"){
+  const pct=total?Math.min(100,done/total*100):0;
+  $("status").innerHTML=`<b>${phase}</b><br>${fmt(done)} / ${fmt(total)} (${pct.toFixed(1)}%)`;
+}
+
+/*
+  IMPORTANT:
+  - The old v5 writer emitted a 12-byte data descriptor even for ZIP64.
+  - A ZIP64 data descriptor must contain 8-byte compressed/uncompressed sizes,
+    so it is 24 bytes including the optional signature.
+  - v6 writes the archive sequentially to File System Access API, so a 10GB
+    archive is never assembled as one giant Blob in RAM.
+*/
+function makeByteEntry(name, bytes){
+  const b=bytes instanceof Uint8Array?bytes:new Uint8Array(bytes);
+  return {type:"bytes",name,size:b.byteLength,readChunk:async(pos,take)=>b.slice(pos,pos+take)};
+}
+function makeIsoChunkEntry(index, offset, size){
+  const name=`__ISO_RECOVERY__/chunks/chunk_${String(index).padStart(6,"0")}.bin`;
+  return {type:"raw",name,size,readChunk:async(pos,take)=>new Uint8Array(await iso.file.slice(offset+pos,offset+pos+take).arrayBuffer())};
+}
+function entryName(e){return e.name||zipName(e)}
+function entrySize(e){return Number(e.size||0)}
+function makeRecoveryEntries(){
+  const chunkSize=CHUNK;
+  const size=iso.file.size;
+  const count=Math.ceil(size/chunkSize);
+  const entries=[];
+  for(let i=0;i<count;i++){
+    const offset=i*chunkSize;
+    const n=Math.min(chunkSize,size-offset);
+    entries.push(makeIsoChunkEntry(i,offset,n));
+  }
+  return {chunkSize,count,entries};
+}
+
+async function makeZipStream(entries,label,directoryHandle=null){
+  if(!entries.length)throw Error("ZIP対象がありません");
+  const writerInfo=await chooseZipWriter(label,directoryHandle);
+  if(!writerInfo){await makeZipBlobFallback(entries,label);return}
+  const w=writerInfo.writer;
+  const central=[];
+  let offset=0n;
+  let total=0n;
+  for(const n of entries)total+=BigInt(entrySize(n));
+  if(total===0n)throw Error("ZIP対象データがありません");
+
+  let done=0n,index=0;
+  let lastProgress=performance.now();
+  const fileCount=entries.length;
+  try{
+    log(`ZIPストリーム作成開始: ${entries.length} entries / 合計 ${fmt(total)}`,"ok");
+    for(const n of entries){
+      const name=entryName(n), size=BigInt(entrySize(n));
+      const zip64=size>=0xffffffffn||offset>=0x100000000n;
+      const local=zipLocalHeader(name,0,size,zip64);
+      await w.write(local);
+      const localOffset=offset;
+      offset+=BigInt(local.length);
+
+      let crc=0xffffffff>>>0;
+      let remaining=Number(size),pos=0;
+      while(remaining>0){
+        const take=Math.min(CHUNK,remaining);
+        const b=await n.readChunk(pos,take);
+        if(!b||b.byteLength!==take)throw Error(`データ長不一致: ${name} (${take} bytes要求 / ${b?.byteLength??0} bytes取得)`);
+        crc=crc32Step(crc,b);
+        await w.write(b);
+        pos+=take;remaining-=take;done+=BigInt(take);offset+=BigInt(take);
+        const nowPerf=performance.now();
+        if(nowPerf-lastProgress>=120||done===total){
+          setZipProgress(Number(done),Number(total),`ZIP作成中: ${index+1} / ${fileCount} エントリ`);
+          lastProgress=nowPerf;
+        }
+      }
+      crc=crc32Finish(crc);
+      const dd=zipDataDescriptor(crc,size,zip64);
+      await w.write(dd);offset+=BigInt(dd.length);
+      central.push({name,crc,size,offset:localOffset,zip64});
+      index++;
+      log(`完了: ${name} (${fmt(size)}) CRC32=${crc.toString(16).padStart(8,"0")}`);
+    }
+
+    const centralOffset=offset;
+    let centralSize=0n;
+    const cdParts=[];
+    for(const r of central){
+      const c=zipCentralHeader(r.name,r.crc,r.size,r.offset,r.zip64);
+      cdParts.push(c);centralSize+=BigInt(c.length);
+    }
+    for(const c of cdParts)await w.write(c);
+    offset+=centralSize;
+
+    const archiveNeedsZip64=central.length>=0xffff||centralOffset>=0x100000000n||centralSize>=0x100000000n||central.some(r=>r.zip64);
+    if(archiveNeedsZip64){
+      const z=makeZip64End(central.length,centralSize,centralOffset);
+      await w.write(z.e);await w.write(z.loc);await w.write(z.end);
+      offset+=BigInt(z.e.length+z.loc.length+z.end.length);
+    }else{
+      const end=concat(w32(0x06054b50),w16(0),w16(0),w16(central.length),w16(central.length),w32(Number(centralSize)),w32(Number(centralOffset)),w16(0));
+      await w.write(end);offset+=BigInt(end.length);
+    }
+    await w.close();
+    $("status").innerHTML=`<b>ZIP保存完了</b><br>${fmt(Number(done))} のデータを書き出しました。<br>出力: ${esc(label)} / ZIPサイズ: ${fmt(Number(offset))}`;
+    log(`ZIP保存完了: ${label} (${fmt(Number(offset))})`,"ok");
+  }catch(e){
+    try{await w.abort()}catch{}
+    throw e;
+  }
+}
+
+function fileEntryFromNode(n){
+  return {type:"file",name:zipName(n),size:n.size,readChunk:async(pos,take)=>{
+    if(n.embeddedData)return n.embeddedData.slice(pos,pos+take);
+    let skip=pos;
+    for(const e of n.extents){
+      const extentBytes=Number(e.length??e.size??0);
+      if(skip>=extentBytes){skip-=extentBytes;continue;}
+      const physicalLba=e.physicalLba??e.lba;
+      const local=Math.min(skip,extentBytes);
+      const available=extentBytes-local;
+      const want=Math.min(take,available);
+      return readAt((iso.dataOffset||0)+physicalLba*iso.sectorSize+local,want);
+    }
+    throw Error(`ファイル範囲を解決できません: ${n.name}`);
+  }};
+}
+
+async function zipNodes(nodes,name,includeRecovery=false){
+  const files=[];
+  function collect(n){if(n.type==="file")files.push(fileEntryFromNode(n));else if(n.children)for(const c of n.children)collect(c)}
+  for(const n of nodes)collect(n);
+  if(!files.length)throw Error("ファイルがありません");
+  if(includeRecovery){
+    const rec=makeRecoveryEntries();
+    const info={
+      format:"ISO Explorer Edge Pro Recovery Chunks",
+      version:1,
+      originalName:iso.file.name,
+      originalSize:iso.file.size,
+      chunkSize:rec.chunkSize,
+      chunkCount:rec.count,
+      sourceLayout:{sectorSize:iso.sectorSize,dataOffset:iso.dataOffset},
+      reconstruction:"chunksをindex順に連結して元ファイルを再構築する。chunksはISO/IMG/BIN元ファイル全体を先頭バイトから保存しているため、解析対象外領域・padding・予約領域・未知領域も保持される。",
+      generatedAt:new Date().toISOString()
+    };
+    files.push(...rec.entries);
+    files.push(makeByteEntry("__ISO_RECOVERY__/manifest.json",new TextEncoder().encode(JSON.stringify(info,null,2))));
+    log(`復元用チャンク追加: ${rec.count} 個 / ${fmt(iso.file.size)}`,"ok");
+  }
+  await makeZipStream(files,name);
+}
+
+/* Small-archive fallback only. Large ZIPs intentionally never use Blob assembly. */
+async function saveBlob(blob,name){
+  if(canUseSaveFilePicker()){
+    const h=await window.showSaveFilePicker({suggestedName:name,types:[{description:"ZIP archive",accept:{"application/zip":[".zip"]}}]});
+    const w=await h.createWritable();await w.write(blob);await w.close();log(`保存完了: ${name}`,"ok");return;
+  }
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),60000);
+}
+
+/* ---------------- Analysis ZIP ---------------- */
+function jsonBlob(x){
+  const seen=new WeakSet();
+  const clean=(key,value)=>{
+    if(key==="parent"||key==="embeddedData")return undefined;
+    if(typeof Blob!=="undefined"&&value instanceof Blob)return undefined;
+    if(typeof File!=="undefined"&&value instanceof File)return undefined;
+    if(typeof ArrayBuffer!=="undefined"&&value instanceof ArrayBuffer)return undefined;
+    if(typeof ArrayBuffer!=="undefined"&&ArrayBuffer.isView(value))return undefined;
+    if(typeof value==="object"&&value!==null){if(seen.has(value))return undefined;seen.add(value)}
+    return value;
+  };
+  return new Blob([JSON.stringify(x,clean,2)],{type:"application/json;charset=utf-8"});
+}
+function makeAnalysisEntries(){
+  const a=[];
+  const summary={
+    tool:"ISO Explorer Edge Pro v14 Recovery Chunk Edition",file:iso.file.name,size:iso.size,
+    sectorSize:iso.sectorSize,dataOffset:iso.dataOffset,filesystem:fsInfo.filesystem,
+    volume:fsInfo.pvd,descriptorCount:fsInfo.descriptors.length,
+    entryCount:flatten(fsInfo.root.children||[]).length,generatedAt:new Date().toISOString()
+  };
+  a.push(["json/analysis_summary.json",jsonBlob(summary)]);
+  a.push(["json/iso9660_descriptors.json",jsonBlob(fsInfo.descriptors)]);
+  a.push(["json/iso9660_path_table.json",jsonBlob(fsInfo.path)]);
+  a.push(["json/eltorito.json",jsonBlob(fsInfo.eltorito)]);
+  a.push(["json/joliet.json",jsonBlob(fsInfo.joliet)]);
+  a.push(["json/udf_structure.json",jsonBlob(fsInfo.udf)]);
+  if(fsInfo.udf?.detected)a.push(["json/udf_descriptors.json",jsonBlob(fsInfo.udf.descriptors)]);
+  const sectorMap=flatten(fsInfo.root.children||[]).map(n=>({path:pathOf(n),type:n.type,size:n.size,startLba:n.startLba,sectors:n.sectors,extents:n.extents}));
+  a.push(["json/iso9660_sector_map.json",jsonBlob(sectorMap)]);
+  a.push(["json/rock_ridge.json",jsonBlob(flatten(fsInfo.root.children||[]).filter(n=>n.rr&&n.rr.entries.length).map(n=>({path:pathOf(n),rockRidge:n.rr})))]);
+  if(fsInfo.pvd){const raw16=readSector(16);a.push(["raw/sector_16_pvd.bin",raw16]);}
+  const base=(iso.dataOffset||0)+16*iso.sectorSize;
+  const avail=Math.max(0,iso.size-base);
+  const vd=readAt(base,Math.min(32*iso.sectorSize,avail));
+  a.push(["raw/descriptor_area_first_32_sectors.bin",vd]);
+  if(fsInfo.udf?.anchors?.length){
+    fsInfo.udf.anchors.forEach((anchor,i)=>{
+      if(anchor?.lba!=null)a.push([`raw/udf_anchor_${String(i).padStart(2,"0")}_lba_${anchor.lba}.bin`,readSector(anchor.lba)]);
+    });
+  }
+  return a;
+}
+async function resolveAnalysisEntries(){
+  const a=makeAnalysisEntries();
+  const out=[];
+  for(const [name,data] of a){
+    const value=(data&&typeof data.then==="function")?await data:data;
+    out.push({name,type:"bytes",size:value.size??value.byteLength,readChunk:async(pos,take)=>new Uint8Array(await value.slice(pos,pos+take).arrayBuffer())});
+  }
+  return out;
+}
+async function analysisZip(directoryHandle=null,outputName=null){
+  const files=await resolveAnalysisEntries();
+  await makeZipStream(files,outputName||iso.file.name.replace(/\.[^.]+$/,"")+"_analysis.zip",directoryHandle);
+}
+
+function makeContentsEntries(){
+  const files=[];
+  function collect(n){if(n.type==="file")files.push(fileEntryFromNode(n));else if(n.children)for(const c of n.children)collect(c)}
+  for(const n of fsInfo.root.children||[])collect(n);
+  if(!files.length)throw Error("ファイルがありません");
+  const rec=makeRecoveryEntries();
+  const info={
+    format:"ISO Explorer Edge Pro Recovery Chunks",
+    version:1,
+    originalName:iso.file.name,
+    originalSize:iso.file.size,
+    chunkSize:rec.chunkSize,
+    chunkCount:rec.count,
+    sourceLayout:{sectorSize:iso.sectorSize,dataOffset:iso.dataOffset},
+    reconstruction:"chunksをindex順に連結して元ファイルを再構築する。chunksはISO/IMG/BIN元ファイル全体を先頭バイトから保存しているため、解析対象外領域・padding・予約領域・未知領域も保持される。",
+    generatedAt:new Date().toISOString()
+  };
+  files.push(...rec.entries);
+  files.push(makeByteEntry("__ISO_RECOVERY__/manifest.json",new TextEncoder().encode(JSON.stringify(info,null,2))));
+  log(`復元用チャンク追加: ${rec.count} 個 / ${fmt(iso.file.size)}`,"ok");
+  return files;
+}
+async function zipNodes(nodes,name,includeRecovery=false,directoryHandle=null){
+  const files=[];
+  function collect(n){if(n.type==="file")files.push(fileEntryFromNode(n));else if(n.children)for(const c of n.children)collect(c)}
+  for(const n of nodes)collect(n);
+  if(!files.length)throw Error("ファイルがありません");
+  if(includeRecovery){
+    const all=makeContentsEntries();
+    await makeZipStream(all,name,directoryHandle);
+    return;
+  }
+  await makeZipStream(files,name,directoryHandle);
+}
+
+/* ---------------- UI ---------------- */
+function wireUI(){
+  const openBtn=$("open"), fileInput=$("file"), clearBtn=$("clear"), upBtn=$("up"), zipSelBtn=$("zipSel"), zipAllBtn=$("zipAll"), analysisBtn=$("analysis"), batchBtn=$("batch"), batchSource=$("batchSource"), drop=$("drop");
+  if(!openBtn||!fileInput) throw new Error("UI初期化失敗: open/file要素が見つかりません");
+  openBtn.addEventListener("click",()=>{
+    try{fileInput.value=""; fileInput.click();}catch(e){log(`ファイル選択を開始できません: ${e.message||e}`,"err");}
+  });
+  fileInput.addEventListener("change",e=>{const f=e.target.files&&e.target.files[0]; if(f) openISO(f);});
+  clearBtn.addEventListener("click",()=>{iso=fsInfo=currentDir=selected=null;udfRuntimePartitions=[];udfRuntimeMaps=[];$("tree").innerHTML="";$("rows").innerHTML="";$("status").textContent="ISOが読み込まれていません。";$("log").textContent="";fileInput.value="";updateButtons();});
+  upBtn.addEventListener("click",()=>{if(currentDir?.parent){currentDir=currentDir.parent;renderRows();renderMeta();updateButtons();}});
+  zipSelBtn.addEventListener("click",async()=>{try{setBusy(true);await zipNodes([selected],iso.file.name.replace(/\.[^.]+$/,"")+"_"+selected.name.replace(/[\\/:*?"<>|]/g,"_")+".zip")}catch(e){log(e.stack||e,"err")}finally{setBusy(false);updateButtons()}});
+  zipAllBtn.addEventListener("click",async()=>{try{setBusy(true);await zipNodes(fsInfo.root.children||[],iso.file.name.replace(/\.[^.]+$/g,"")+"_contents.zip",true)}catch(e){log(e.stack||e,"err")}finally{setBusy(false);updateButtons()}});
+  analysisBtn.addEventListener("click",async()=>{try{setBusy(true);await analysisZip()}catch(e){log(e.stack||e,"err")}finally{setBusy(false);updateButtons()}});
+  batchBtn.addEventListener("click",()=>{
+    try{
+      if(!window.showDirectoryPicker || window.self!==window.top){
+        log("フォルダへ直接保存する一括機能は、EdgeでこのHTMLを直接タブとして開いた場合に使用できます。iframe内ではFile System Access APIの制限によりフォルダ選択ができません。","err");
+        return;
+      }
+      batchSource.value="";
+      batchSource.click();
+    }catch(e){log(e.stack||e,"err")}
+  });
+  batchSource.addEventListener("change",async e=>{
+    const list=[...(e.target.files||[])].filter(f=>/\.(iso|img|bin)$/i.test(f.name));
+    if(!list.length){log("選択フォルダ内にISO/IMG/BINがありません。","err");return;}
+    try{
+      setBusy(true);
+      const dest=await window.showDirectoryPicker({mode:"readwrite"});
+      const first=list[0].webkitRelativePath||list[0].name;
+      const rootName=first.includes("/")?first.split("/")[0]:"ISO";
+      log(`一括保存開始: ${list.length} 個 / 保存先ルート: ${rootName}`,"ok");
+      let success=0,failed=0;
+      for(let i=0;i<list.length;i++){
+        const f=list[i];
+        try{
+          iso={file:f,size:f.size};
+          fsInfo=await analyze();
+          const rel=f.webkitRelativePath||f.name;
+          const parts=rel.split("/");
+          parts.pop();
+          let dir=dest;
+          for(const part of parts){if(!part)continue;dir=await dir.getDirectoryHandle(part,{create:true});}
+          const base=f.name.replace(/\.[^.]+$/i,"");
+          await analysisZip(dir,base+"_analysis.zip");
+          await zipNodes(fsInfo.root.children||[],base+"_contents.zip",true,dir);
+          success++;
+          log(`一括保存完了 [${i+1}/${list.length}]: ${rel}`,"ok");
+        }catch(err){
+          failed++;
+          log(`一括処理失敗 [${i+1}/${list.length}] ${f.webkitRelativePath||f.name}: ${err.stack||err}`,"err");
+        }
+      }
+      log(`一括保存終了: 成功 ${success} / 失敗 ${failed} / 全 ${list.length}`,failed?"err":"ok");
+    }catch(err){log(err.stack||err,"err")}
+    finally{setBusy(false);updateButtons();batchSource.value=""}
+  });
+  ["dragenter","dragover"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("over")}));
+  ["dragleave","drop"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove("over")}));
+  drop.addEventListener("drop",e=>{const f=e.dataTransfer?.files?.[0];if(f)openISO(f)});
+  window.addEventListener("error",e=>{try{log(`JavaScriptエラー: ${e.message||e.error||"unknown"}`,"err")}catch{}});
+  window.addEventListener("unhandledrejection",e=>{try{log(`非同期エラー: ${e.reason?.stack||e.reason||"unknown"}`,"err")}catch{}});
+  updateButtons();
+}
+wireUI();
+</script>
+</body>
+</html>

@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ISO Explorer Pro</title>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<style>
+:root{--bg:#f3f5f7;--panel:#fff;--line:#d6dbe1;--text:#20242a;--muted:#68727e;--accent:#0879d1;--sel:#dceeff}
+*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}
+body{font-family:"Segoe UI","Yu Gothic UI",Meiryo,sans-serif;color:var(--text);background:var(--bg)}
+.app{height:100%;display:flex;flex-direction:column}
+.title{height:42px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 14px;font-weight:600}
+.title span{margin-left:12px;color:var(--muted);font-weight:400;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.toolbar{background:#fff;border-bottom:1px solid var(--line);padding:7px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+button{border:1px solid var(--line);background:#fff;border-radius:5px;padding:7px 11px;cursor:pointer}
+button:hover{background:#f0f6fb}button.primary{background:var(--accent);border-color:var(--accent);color:white}
+button:disabled{opacity:.45;cursor:not-allowed}input[type=file]{display:none}
+.info{height:30px;background:#fafbfc;border-bottom:1px solid var(--line);padding:7px 12px;color:var(--muted);font-size:12px}
+.main{min-height:0;flex:1;display:flex}
+.tree{width:285px;background:#fff;border-right:1px solid var(--line);overflow:auto;padding:7px}
+.treeitem{padding:5px 7px;border-radius:4px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.treeitem:hover{background:#f3f6f9}.treeitem.sel{background:var(--sel)}
+.content{min-width:0;flex:1;display:flex;flex-direction:column;background:#fff}
+.path{height:37px;border-bottom:1px solid var(--line);padding:10px 12px;font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tablewrap{min-height:0;flex:1;overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:7px 9px;border-bottom:1px solid #edf0f3;text-align:left}
+th{position:sticky;top:0;background:#f8f9fb;z-index:1}
+.row:hover{background:#f6faff}.row.sel{background:var(--sel)}
+.name{display:flex;align-items:center;gap:8px}.folder{font-weight:500}
+.empty{text-align:center;color:var(--muted);padding:45px}
+.status{height:28px;border-top:1px solid var(--line);background:#f7f8fa;padding:6px 10px;color:var(--muted);font-size:12px}
+.drop{margin:10px;padding:22px 8px;border:2px dashed #bcc5cf;border-radius:8px;text-align:center;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="app">
+<div class="title">ISO Explorer Pro<span id="titleInfo">ISOファイルを開いてください</span></div>
+<div class="toolbar">
+<label><button id="open">ISOを開く</button><input id="file" type="file" accept=".iso,.img,application/octet-stream"></label>
+<button id="up" disabled>上へ</button>
+<button id="extract" class="primary" disabled>選択項目をZIP化</button>
+<button id="contents" disabled>ISO全体をZIP化</button>
+<button id="analysis" disabled>解析データZIP</button>
+<button id="clear">クリア</button>
+</div>
+<div id="info" class="info">ISO9660 → Joliet/Rock Ridge → UDF の順で検査します。</div>
+<div class="main">
+<aside class="tree" id="tree"><div class="drop">ISOをここへドラッグ＆ドロップ</div></aside>
+<section class="content">
+<div class="path" id="path">/</div>
+<div class="tablewrap" id="table"><div class="empty">ISOファイルを開いてください。</div></div>
+</section>
+</div>
+<div class="status" id="status">待機中</div>
+</div>
+
+<script>
+"use strict";
+
+/*
+ ISO Explorer Pro
+ 1. System Area
+ 2. Volume Descriptor Set
+ 3. ISO9660 Primary Volume Descriptor
+ 4. Supplementary/Joliet descriptors
+ 5. Directory Records
+ 6. Rock Ridge System Use Entries
+ 7. Path Table
+ 8. UDF Anchor / Volume Descriptor structures
+ 9. Sector map
+ 10. ZIP export
+*/
+
+const SECTOR=2048;
+let state={file:null,buffer:null,bytes:null,root:null,current:null,selected:null,analysis:null};
+
+const $=id=>document.getElementById(id);
+const le16=(b,o)=>b[o]|b[o+1]<<8;
+const le32=(b,o)=>(b[o]|b[o+1]<<8|b[o+2]<<16|b[o+3]<<24)>>>0;
+const be16=(b,o)=>b[o]<<8|b[o+1];
+const be32=(b,o)=>(b[o]*0x1000000+b[o+1]*0x10000+b[o+2]*256+b[o+3])>>>0;
+const both16=(b,o)=>({little:le16(b,o),big:be16(b,o+2)});
+const both32=(b,o)=>({little:le32(b,o),big:be32(b,o+4)});
+const atext=(b,o,n)=>new TextDecoder("ascii").decode(b.slice(o,o+n)).replace(/\0/g,"").trim();
+function unicodeJoliet(b,o,n){let s="";for(let i=o;i+1<o+n;i+=2){let c=(b[i]<<8)|b[i+1];if(!c)break;s+=String.fromCharCode(c)}return s.replace(/\0/g,"").trim()}
+function safe(s){return (s||"_").replace(/[<>:"/\\|?*\x00-\x1f]/g,"_").replace(/\s+$/,"")||"_"}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function hex(b){let out=[];for(let i=0;i<b.length;i+=16){let line=[i.toString(16).padStart(8,"0")];for(let j=0;j<16&&i+j<b.length;j++)line.push(b[i+j].toString(16).padStart(2,"0"));out.push(line.join(" "))}return out.join("\n")}
+
+function descriptorScan(bytes){
+  const out=[], max=Math.min(256,Math.floor(bytes.length/SECTOR));
+  for(let s=16;s<max;s++){
+    const d=bytes.slice(s*SECTOR,(s+1)*SECTOR);
+    if(d.length<7)break;
+    const type=d[0],id=atext(d,1,5),version=d[6];
+    if(id==="CD001"){
+      out.push({sector:s,type,identifier:id,version});
+      if(type===255)break;
+    }
+  }
+  return out;
+}
+
+function readSystemUse(record,start,len){
+  const result=[];
+  let p=start,end=Math.min(start+len,record.length);
+  while(p+4<=end){
+    const sig=String.fromCharCode(record[p],record[p+1]);
+    const l=record[p+2],ver=record[p+3];
+    if(!sig||l<4||p+l>end)break;
+    const x=record.slice(p,p+l);
+    if(sig==="NM" && l>=5) result.push({signature:sig,version:ver,name:atext(x,5,l-5)});
+    else if(sig==="PX" && l>=36) result.push({signature:sig,version:ver,mode:le32(x,4),links:le32(x,12),uid:le32(x,20),gid:le32(x,28)});
+    else if(sig==="TF") result.push({signature:sig,version:ver,length:l});
+    else if(sig==="SL") result.push({signature:sig,version:ver,length:l});
+    else result.push({signature:sig,version:ver,length:l});
+    p+=l;
+  }
+  return result;
+}
+
+function parseDirectory(bytes,node,blockSize,sectorMap,visited){
+  const key=node.extent+":"+node.size;
+  if(visited.has(key))return;
+  visited.add(key);
+  const start=node.extent*blockSize,end=Math.min(start+node.size,bytes.length);
+  if(start<0||start>=bytes.length)return;
+  const data=bytes.slice(start,end);
+  let p=0;
+  while(p<data.length){
+    const len=data[p];
+    if(len===0){p=(Math.floor(p/blockSize)+1)*blockSize;continue}
+    if(len<34||p+len>data.length)break;
+    const r=data.slice(p,p+len);
+    const extent=le32(r,2),size=le32(r,10),flags=r[25],nameLen=r[32];
+    if(33+nameLen>r.length){p+=len;continue}
+    const rawName=r.slice(33,33+nameLen);
+    let name;
+    if(nameLen===1&&rawName[0]===0)name=".";
+    else if(nameLen===1&&rawName[0]===1)name="..";
+    else name=atext(rawName,0,rawName.length).replace(/;[0-9]+$/,"");
+    const suStart=33+nameLen+(nameLen%2===0?1:0);
+    const rr=suStart<r.length?readSystemUse(r,suStart,r.length-suStart):[];
+    const rrName=rr.find(x=>x.signature==="NM"&&x.name);
+    if(name!=="."&&name!==".."){
+      const dir=(flags&2)!==0;
+      const finalName=safe(rrName?.name||name);
+      const child={
+        name:finalName,originalName:name,type:dir?"dir":"file",extent,size,flags,
+        path:(node.path==="/"?"":node.path)+"/"+finalName,
+        rockRidge:rr,children:[],recordLength:len
+      };
+      node.children.push(child);
+      sectorMap.push({
+        path:child.path,type:child.type,extent:extent,byteOffset:extent*blockSize,
+        size:size,startSector:Math.floor(extent*blockSize/SECTOR),
+        sectorCount:Math.ceil(size/SECTOR),recordLength:len
+      });
+      if(dir&&size>0&&extent!==node.extent)parseDirectory(bytes,child,blockSize,sectorMap,visited);
+    }
+    p+=len;
+  }
+}
+
+function parsePathTable(bytes,pvd,blockSize,analysis){
+  // ISO9660 little-endian path table L at offset 140; size 132.
+  const size=le32(pvd,132),loc=le32(pvd,140);
+  const result=[];
+  if(size&&loc){
+    const start=loc*blockSize,end=Math.min(start+size,bytes.length);
+    if(start<bytes.length){
+      const d=bytes.slice(start,end);let p=0,index=1;
+      while(p+8<=d.length&&index<100000){
+        const n=d[p],extent=le32(d,p+2),parent=le16(d,p+6);
+        if(n===0||p+8+n>d.length)break;
+        result.push({index,name:atext(d,p+8,n),extent,parentIndex:parent});
+        p+=8+n+(n%2);index++;
+      }
+    }
+  }
+  analysis.pathTable={sizeBytes:size,startLogicalBlock:loc,entries:result};
+}
+
+function parseIso(){
+  const bytes=state.bytes,pvd=bytes.slice(16*SECTOR,17*SECTOR);
+  if(pvd.length<SECTOR||atext(pvd,1,5)!=="CD001")throw Error("ISO9660 PVDが見つかりません。");
+  const bs=both16(pvd,128).little, volume=both32(pvd,80), rootLen=pvd[156];
+  const rr=pvd.slice(156,156+rootLen), rootExtent=le32(rr,2),rootSize=le32(rr,10);
+  const descriptors=descriptorScan(bytes);
+  const analysis={
+    format:"ISO9660",
+    sectorSize:SECTOR,
+    fileSize:state.file.size,
+    totalSectors:Math.ceil(state.file.size/SECTOR),
+    descriptors,
+    iso9660:{
+      standardIdentifier:atext(pvd,1,5),version:pvd[6],
+      systemIdentifier:atext(pvd,8,32),volumeIdentifier:atext(pvd,40,32),
+      volumeSpaceSize:volume,logicalBlockSize:bs,
+      volumeSetIdentifier:atext(pvd,190,128),
+      publisherIdentifier:atext(pvd,318,128),
+      dataPreparerIdentifier:atext(pvd,446,128),
+      applicationIdentifier:atext(pvd,574,128),
+      copyrightFileIdentifier:atext(pvd,702,37),
+      abstractFileIdentifier:atext(pvd,739,37),
+      bibliographicFileIdentifier:atext(pvd,776,37),
+      creationDate:atext(pvd,813,17),modificationDate:atext(pvd,830,17),
+      expirationDate:atext(pvd,847,17),effectiveDate:atext(pvd,864,17),
+      rootDirectory:{extent:rootExtent,size:rootSize,recordLength:rootLen}
+    },
+    sectorMap:[],pathTable:null,joliet:null,rockRidge:{detected:false}
+  };
+
+  // Boot records and supplementary descriptors.
+  const boot=[],supp=[];
+  for(const d of descriptors){
+    const raw=bytes.slice(d.sector*SECTOR,(d.sector+1)*SECTOR);
+    if(d.type===0)boot.push({sector:d.sector,systemIdentifier:atext(raw,7,32),bootCatalogPointer:le32(raw,71)});
+    if(d.type===2){
+      const esc=atext(raw,88,32);
+      supp.push({sector:d.sector,escapeSequences:esc,volumeIdentifier:unicodeJoliet(raw,40,32),logicalBlockSize:le16(raw,128),rootExtent:le32(raw,158),rootSize:le32(raw,166)});
+    }
+  }
+  analysis.bootRecords=boot;
+  analysis.joliet=supp.length?supp:null;
+
+  const root={name:"",path:"/",type:"dir",extent:rootExtent,size:rootSize,children:[],rockRidge:[]};
+  parsePathTable(bytes,pvd,bs,analysis);
+  parseDirectory(bytes,root,bs,analysis.sectorMap,new Set());
+  analysis.rockRidge.detected=analysis.sectorMap.some(x=>false);
+  // Detect RR at actual child level.
+  const stack=[root];
+  while(stack.length){const n=stack.pop();if(n.rockRidge?.length)analysis.rockRidge.detected=true;for(const c of n.children)if(c.type==="dir")stack.push(c)}
+  return {root,analysis};
+}
+
+function parseUdf(){
+  const b=state.bytes,total=Math.floor(b.length/SECTOR),descs=[],seen=new Set();
+  const add=(sector,tag,name)=>{
+    if(sector<0||sector>=total||seen.has(sector+":"+tag))return;
+    seen.add(sector+":"+tag);descs.push({sector,tag,name,descriptorVersion:le16(b,sector*SECTOR+2),serialNumber:le16(b,sector*SECTOR+16),crc:le16(b,sector*SECTOR+8)});
+  };
+  // UDF Anchor Volume Descriptor Pointer: descriptor tag 2 at sector 256 and commonly near end.
+  [256,total-256,total-1].forEach(s=>{
+    if(s>=0&&s<total&&le16(b,s*SECTOR)===2)add(s,2,"Anchor Volume Descriptor Pointer");
+  });
+  // Scan VDS candidates around sector 256 and first 1024 sectors.
+  const scan=Math.min(total,1024);
+  const names={1:"Primary Volume Descriptor",2:"Anchor Volume Descriptor Pointer",3:"Volume Descriptor Pointer",4:"Implementation Use Volume Descriptor",5:"Partition Descriptor",6:"Logical Volume Descriptor",7:"Unallocated Space Descriptor",8:"Terminating Descriptor",9:"Logical Volume Integrity Descriptor"};
+  for(let s=0;s<scan;s++){const tag=le16(b,s*SECTOR);if(names[tag])add(s,tag,names[tag])}
+  // File Set / File Entry tags are useful evidence even when the anchor is not in a conventional location.
+  for(let s=0;s<Math.min(total,16384);s++){
+    const tag=le16(b,s*SECTOR);
+    if(tag===256)add(s,tag,"File Set Descriptor");
+    else if(tag===261)add(s,tag,"File Entry");
+    else if(tag===266)add(s,tag,"Extended File Entry");
+  }
+  return {present:descs.some(x=>x.tag===2||x.tag===6||x.tag===256||x.tag===261||x.tag===266),sectorSize:SECTOR,descriptorCount:descs.length,descriptors:descs};
+}
+
+function analyze(){
+  const {root,analysis}=parseIso();
+  analysis.udf=parseUdf();
+  analysis.summary={
+    fileName:state.file.name,fileSize:state.file.size,
+    totalSectors:Math.ceil(state.file.size/SECTOR),sectorSize:SECTOR,
+    detectedFormats:{ISO9660:true,Joliet:!!analysis.joliet,RockRidge:analysis.rockRidge.detected,UDF:analysis.udf.present},
+    generatedAt:new Date().toISOString()
+  };
+  state.root=root;state.current=root;state.analysis=analysis;
+}
+
+function render(){
+  const tree=$("tree");tree.innerHTML="";
+  if(!state.root){tree.innerHTML='<div class="drop">ISOをここへドラッグ＆ドロップ</div>';$("table").innerHTML='<div class="empty">ISOファイルを開いてください。</div>';return}
+  function add(n,depth){
+    const d=document.createElement("div");d.className="treeitem"+(n===state.current?" sel":"");
+    d.style.paddingLeft=(7+depth*15)+"px";
+    d.textContent=(n.type==="dir"?"📁 ":"📄 ")+(n===state.root?"ISO":n.name);
+    d.onclick=()=>{state.current=n;state.selected=null;render()};
+    tree.appendChild(d);
+    for(const c of n.children||[])if(c.type==="dir")add(c,depth+1);
+  }
+  add(state.root,0);
+  $("path").textContent=state.current.path;
+  const rows=(state.current.children||[]).map(n=>`<tr class="row" data-path="${esc(n.path)}"><td><div class="name">${n.type==="dir"?"📁":"📄"} <span class="${n.type==="dir"?"folder":""}">${esc(n.name)}</span></div></td><td>${n.type==="dir"?"フォルダー":"ファイル"}</td><td>${n.size.toLocaleString()} bytes</td><td>${n.extent}</td><td>${Math.ceil(n.size/SECTOR)}</td></tr>`).join("");
+  $("table").innerHTML=rows?`<table><thead><tr><th>名前</th><th>種類</th><th>サイズ</th><th>開始論理ブロック</th><th>セクタ数</th></tr></thead><tbody>${rows}</tbody></table>`:'<div class="empty">このフォルダーは空です。</div>';
+  document.querySelectorAll(".row").forEach(r=>{
+    r.onclick=()=>{state.selected=findPath(r.dataset.path);document.querySelectorAll(".row").forEach(x=>x.classList.remove("sel"));r.classList.add("sel")};
+    r.ondblclick=()=>{const n=findPath(r.dataset.path);if(n.type==="dir"){state.current=n;state.selected=null;render()}};
+  });
+  $("up").disabled=state.current===state.root;
+}
+
+function findPath(path){
+  if(path==="/")return state.root;let n=state.root;
+  for(const p of path.split("/").filter(Boolean)){n=(n.children||[]).find(x=>x.name===p);if(!n)return null}return n;
+}
+function nodeBytes(n){
+  const bs=state.analysis.iso9660.logicalBlockSize;
+  const off=n.extent*bs;
+  return state.bytes.slice(off,Math.min(off+n.size,state.bytes.length));
+}
+function addToZip(zip,n,prefix=""){
+  const name=prefix+(n===state.root?"":n.name);
+  if(n.type==="file"){zip.file(name,nodeBytes(n));return}
+  const dir=name?name+"/":"";
+  if(n!==state.root)zip.folder(name);
+  for(const c of n.children||[])addToZip(zip,c,dir);
+}
+async function saveZip(zip,name){
+  const blob=await zip.generateAsync({type:"blob",compression:"DEFLATE",compressionOptions:{level:6}});
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000);
+}
+function json(zip,name,obj){zip.file(name,JSON.stringify(obj,null,2))}
+function analysisZip(){
+  const z=new JSZip(),b=state.bytes,a=state.analysis,total=Math.ceil(b.length/SECTOR);
+  z.file("raw/system_area_0-15.bin",b.slice(0,Math.min(16*SECTOR,b.length)));
+  z.file("raw/sector_16_volume_descriptor.bin",b.slice(16*SECTOR,Math.min(17*SECTOR,b.length)));
+  z.file("raw/volume_descriptor_set_16-31.bin",b.slice(16*SECTOR,Math.min(32*SECTOR,b.length)));
+  if(a.udf.present){
+    z.file("raw/udf_anchor_256.bin",b.slice(256*SECTOR,Math.min(257*SECTOR,b.length)));
+  }
+  json(z,"json/analysis_summary.json",a.summary);
+  json(z,"json/iso9660_metadata.json",a.iso9660);
+  json(z,"json/iso9660_descriptors.json",a.descriptors);
+  json(z,"json/iso9660_path_table.json",a.pathTable);
+  json(z,"json/iso9660_sector_map.json",{sectorSize:SECTOR,totalSectors:total,entries:a.sectorMap});
+  json(z,"json/boot_records.json",a.bootRecords);
+  json(z,"json/joliet.json",a.joliet||{present:false});
+  json(z,"json/rock_ridge.json",a.rockRidge);
+  json(z,"json/udf_structure.json",a.udf);
+  return z;
+}
+
+async function openIso(file){
+  try{
+    state.file=file;state.buffer=await file.arrayBuffer();state.bytes=new Uint8Array(state.buffer);
+    analyze();render();
+    const a=state.analysis;
+    $("titleInfo").textContent=file.name;
+    $("info").textContent=`ISO9660: OK / Joliet: ${a.joliet?"検出":"なし"} / Rock Ridge: ${a.rockRidge.detected?"検出":"なし"} / UDF: ${a.udf.present?"検出":"なし"} / エントリ: ${a.sectorMap.length.toLocaleString()}`;
+    $("status").textContent=`${file.name} — ${file.size.toLocaleString()} bytes`;
+    $("extract").disabled=false;$("contents").disabled=false;$("analysis").disabled=false;
+  }catch(e){
+    console.error(e);alert("ISOの解析に失敗しました。\n"+e.message);clearAll();
+  }
+}
+function clearAll(){
+  state={file:null,buffer:null,bytes:null,root:null,current:null,selected:null,analysis:null};
+  $("titleInfo").textContent="ISOファイルを開いてください";
+  $("info").textContent="ISO9660 → Joliet/Rock Ridge → UDF の順で検査します。";
+  $("status").textContent="待機中";
+  $("extract").disabled=true;$("contents").disabled=true;$("analysis").disabled=true;$("up").disabled=true;
+  render();
+}
+
+$("open").onclick=()=>$("file").click();
+$("file").onchange=e=>{if(e.target.files[0])openIso(e.target.files[0])};
+$("up").onclick=()=>{if(state.current&&state.current!==state.root){state.current=findPath(state.current.path.split("/").slice(0,-1).join("/")||"/");state.selected=null;render()}};
+$("extract").onclick=async()=>{
+  if(!state.selected)return alert("ZIP化する項目を選択してください。");
+  const z=new JSZip();addToZip(z,state.selected);
+  await saveZip(z,safe(state.file.name.replace(/\.(iso|img)$/i,""))+"_"+safe(state.selected.name)+".zip");
+};
+$("contents").onclick=async()=>{
+  const z=new JSZip();addToZip(z,state.root);await saveZip(z,safe(state.file.name.replace(/\.(iso|img)$/i,""))+"_contents.zip");
+};
+$("analysis").onclick=async()=>{
+  const z=analysisZip();await saveZip(z,safe(state.file.name.replace(/\.(iso|img)$/i,""))+"_analysis.zip");
+};
+$("clear").onclick=clearAll;
+
+document.addEventListener("dragover",e=>e.preventDefault());
+document.addEventListener("drop",e=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)openIso(f)});
+render();
+</script>
+</body>
+</html>

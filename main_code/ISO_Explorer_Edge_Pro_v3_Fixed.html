@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ISO Explorer Edge Pro v3</title>
+<style>
+:root{font-family:Segoe UI,system-ui,sans-serif;color:#e8edf5;background:#101318}
+*{box-sizing:border-box}body{margin:0;height:100vh;display:flex;flex-direction:column}
+header{padding:12px 16px;background:#171b22;border-bottom:1px solid #2b313b}
+h1{margin:0;font-size:18px}.sub{color:#9da7b5;font-size:12px;margin-top:4px}
+.toolbar{display:flex;gap:7px;flex-wrap:wrap;padding:10px 12px;background:#1b2028;border-bottom:1px solid #2b313b}
+button{border:1px solid #39414e;background:#252c36;color:#eef2f7;border-radius:7px;padding:8px 11px;cursor:pointer}
+button:hover{background:#303946}button:disabled{opacity:.45;cursor:not-allowed}
+main{display:grid;grid-template-columns:340px 1fr;min-height:0;flex:1}
+aside{border-right:1px solid #2b313b;overflow:auto;padding:10px}
+section{min-width:0;display:flex;flex-direction:column}
+.drop{border:1px dashed #566274;border-radius:9px;padding:14px;text-align:center;color:#aeb8c7;margin-bottom:10px}
+.drop.over{background:#222a35;border-color:#8bb7ff}
+#tree{font-size:13px;line-height:1.55}.node{padding:3px 6px;border-radius:5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.node:hover{background:#202733}.node.sel{background:#30445d}.indent{margin-left:16px}
+.meta{padding:10px 12px;border-bottom:1px solid #2b313b;background:#151a21;font-size:12px;color:#aeb7c4}
+#status{white-space:pre-wrap}.tablewrap{overflow:auto;flex:1}
+table{border-collapse:collapse;width:100%;font-size:12px}th,td{padding:7px 9px;border-bottom:1px solid #252c35;text-align:left;white-space:nowrap}
+th{position:sticky;top:0;background:#1c222b;z-index:1}.num{text-align:right;font-variant-numeric:tabular-nums}
+#log{height:120px;overflow:auto;background:#0b0e12;color:#aeb9c7;font:11px Consolas,monospace;padding:8px;border-top:1px solid #2b313b}
+.badge{display:inline-block;padding:2px 6px;border-radius:99px;background:#29323f;margin-left:5px}
+.ok{color:#8ee6ad}.warn{color:#ffd479}.err{color:#ff8f8f}
+.small{font-size:11px;color:#8994a4}
+</style>
+</head>
+<body>
+<header>
+  <h1>ISO Explorer Edge Pro v3</h1>
+  <div class="sub">ISO9660 / Joliet / Rock Ridge / El Torito / UDF検出・大容量ISO対応 / ZIP64</div>
+</header>
+<div class="toolbar">
+  <button id="open">ISOを開く</button>
+  <button id="up" disabled>上へ</button>
+  <button id="zipSel" disabled>選択項目をZIP</button>
+  <button id="zipAll" disabled>ISO全体をZIP</button>
+  <button id="analysis" disabled>解析データZIP</button>
+  <button id="clear">クリア</button>
+  <input id="file" type="file" accept=".iso,.img,.bin" hidden>
+</div>
+<main>
+  <aside>
+    <div id="drop" class="drop">ISO / IMG をここへドラッグ＆ドロップ</div>
+    <div id="tree"></div>
+  </aside>
+  <section>
+    <div class="meta" id="status">ISOが読み込まれていません。</div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>名前</th><th>種類</th><th class="num">サイズ</th><th class="num">開始LBA</th><th class="num">セクタ数</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <pre id="log"></pre>
+  </section>
+</main>
+<script>
+"use strict";
+
+/* =========================================================
+   ISO Explorer Edge Pro v3
+   - Whole ISO is NOT loaded into RAM.
+   - Reads only required ranges with Blob.slice().
+   - Detects ISO9660 at 2048/2352/2336/2448 style offsets.
+   - Parses PVD, descriptor set, Joliet, Rock Ridge, El Torito,
+     path table, multi-extent files and UDF structural tags.
+   - ZIP writer supports ZIP64 and can stream directly to disk
+     through File System Access API on Edge.
+   ========================================================= */
+
+const SECTOR=2048;
+const CHUNK=4*1024*1024;
+let iso=null, fsInfo=null, currentDir=null, selected=null;
+const $=id=>document.getElementById(id);
+const log=(s,cls="")=>{$("log").insertAdjacentHTML("beforeend",`<div class="${cls}">${esc(String(s))}</div>`);$("log").scrollTop=$("log").scrollHeight};
+const esc=s=>s.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt=n=>{if(n==null)return "-";let u=["B","KiB","MiB","GiB","TiB"],i=0,x=Number(n);while(x>=1024&&i<u.length-1){x/=1024;i++}return `${x.toFixed(i?2:0)} ${u[i]}`};
+const dec=new TextDecoder("latin1");
+const u16=(a,o,little=true)=>new DataView(a.buffer,a.byteOffset,a.byteLength).getUint16(o,little);
+const u32=(a,o,little=true)=>new DataView(a.buffer,a.byteOffset,a.byteLength).getUint32(o,little);
+function both16(a,o){return [u16(a,o,true),u16(a,o,false)]}
+function both32(a,o){return [u32(a,o,true),u32(a,o,false)]}
+function trim0(s){return s.replace(/\0+$/,"").replace(/\s+$/,"")}
+function ascii(a,o,n){return trim0(dec.decode(a.slice(o,o+n)))}
+function bytesHex(a){return [...a].map(x=>x.toString(16).padStart(2,"0")).join("")}
+function readStr(a,o,n,encoding="latin1"){try{return trim0(new TextDecoder(encoding,{fatal:false}).decode(a.slice(o,o+n)))}catch{return trim0(dec.decode(a.slice(o,o+n)))}}
+async function readAt(offset,length){
+  if(offset<0||length<0||offset+length>iso.size) throw Error("範囲外の読み込み");
+  return new Uint8Array(await iso.file.slice(offset,offset+length).arrayBuffer());
+}
+async function readSector(lba,count=1){
+  return readAt((iso.dataOffset||0)+lba*iso.sectorSize,count*iso.sectorSize);
+}
+function parseDate17(a,o){return ascii(a,o,17)}
+function safeName(s,fallback="unnamed"){s=s.replace(/\0/g,"").trim();return s||fallback}
+function normalizeName(s){return s.replace(/;1$/,"").replace(/\.$/,"")||"ROOT"}
+
+function detectPVD(buf){
+  const candidates=[
+    {sectorSize:2048,dataOffset:0,sector:16,idOffset:1},
+    {sectorSize:2352,dataOffset:16,sector:16,idOffset:17},
+    {sectorSize:2352,dataOffset:24,sector:16,idOffset:25},
+    {sectorSize:2336,dataOffset:0,sector:16,idOffset:1},
+    {sectorSize:2448,dataOffset:16,sector:16,idOffset:17},
+    {sectorSize:2448,dataOffset:24,sector:16,idOffset:25}
+  ];
+  for(const c of candidates){
+    const pos=c.sector*c.sectorSize+c.idOffset;
+    if(pos+5<=buf.length && ascii(buf,pos,5)==="CD001") return c;
+  }
+  return null;
+}
+async function detectLayout(){
+  const n=Math.min(24*4096,iso.size);
+  const b=await readAt(0,n);
+  let c=detectPVD(b);
+  if(c)return c;
+  // Generic search around the expected descriptor region. This catches
+  // uncommon raw sector layouts without scanning a huge image.
+  for(const ss of [2048,2352,2336,2448]){
+    for(const off of [0,8,16,24,32]){
+      const pos=16*ss+off+1;
+      if(pos+5<=b.length&&ascii(b,pos,5)==="CD001")
+        return {sectorSize:ss,dataOffset:off,sector:16,idOffset:off+1};
+    }
+  }
+  return null;
+}
+
+function rrParse(su){
+  const out={entries:[],name:null,mode:null,uid:null,gid:null};
+  let p=0;
+  while(p+4<=su.length){
+    const sig=String.fromCharCode(su[p],su[p+1]),len=su[p+2];
+    if(!len||p+len>su.length)break;
+    const x=su.slice(p,p+len);out.entries.push({sig,length:len,raw:bytesHex(x)});
+    if(sig==="NM"&&len>=5){
+      out.name=(out.name||"")+new TextDecoder().decode(x.slice(5));
+    }else if(sig==="PX"&&len>=36){
+      out.mode=both32(x,4)[0];out.uid=both32(x,20)[0];out.gid=both32(x,28)[0];
+    }
+    p+=len;
+  }
+  return out;
+}
+
+async function parseDir(extent,size,parent,depth=0){
+  if(depth>64)throw Error("ディレクトリ深度上限を超えました");
+  const raw=await readAt((iso.dataOffset||0)+extent*iso.sectorSize,size);
+  const out=[], extentsByKey=new Map();
+  let p=0;
+  while(p<raw.length){
+    const len=raw[p];
+    if(len===0){p=((Math.floor(p/iso.sectorSize)+1)*iso.sectorSize);continue}
+    if(p+len>raw.length)break;
+    if(len<34){p+=len;continue}
+    const flags=raw[p+25], nameLen=raw[p+32], nameBytes=raw.slice(p+33,p+33+nameLen);
+    let name;
+    if(nameLen===1&&(nameBytes[0]===0||nameBytes[0]===1)) name=nameBytes[0]===0?".":"..";
+    else name=dec.decode(nameBytes);
+    const extAttrLen=raw[p+1], lba=both32(raw,p+2)[0], size32=both32(raw,p+10)[0];
+    const recDate=ascii(raw,p+18,7);
+    const suStart=33+nameLen+(nameLen%2===0?1:0);
+    const su=raw.slice(p+suStart+extAttrLen,p+len);
+    const rr=rrParse(su);
+    if(rr.name)name=rr.name;
+    const isDir=!!(flags&2), multi=!!(flags&0x80);
+    if(name!=="."&&name!==".."){
+      const key=normalizeName(name).toLowerCase();
+      let node=extentsByKey.get(key);
+      if(multi&&node){
+        node.extents.push({lba,size:size32});
+        node.size+=size32;
+        node.sectors+=Math.ceil(size32/iso.sectorSize);
+      }else{
+        node={name:safeName(name),rawName:dec.decode(nameBytes),type:isDir?"dir":"file",
+          size:size32,startLba:lba,sectors:Math.ceil(size32/iso.sectorSize),
+          flags,recordDate:recDate,extents:[{lba,size:size32}],parent,depth,rr};
+        out.push(node);
+        if(multi)extentsByKey.set(key,node);
+      }
+    }
+    p+=len;
+  }
+  for(const n of out) if(n.type==="dir"&&n.name!=="."){
+    n.children=await parseDir(n.startLba,n.size,n,depth+1);
+  }
+  return out;
+}
+
+async function parseDescriptors(){
+  const ds=[];
+  let term=false;
+  for(let lba=16;lba<1024&&lba*iso.sectorSize<iso.size;lba++){
+    const b=await readSector(lba);
+    const type=b[0], id=ascii(b,1,5), ver=b[6];
+    if(id!=="CD001") {if(lba===16)throw Error("ISO9660 PVDが見つかりません"); continue}
+    const d={lba,type,id,version:ver};
+    if(type===0){d.systemId=ascii(b,8,32);d.bootSystemId=ascii(b,7,32);d.bootCatalogLba=both32(b,71)[0];d.raw=bytesHex(b.slice(0,128))}
+    if(type===1){
+      d.systemId=ascii(b,8,32);d.volumeId=ascii(b,40,32);
+      d.volumeSpace=both32(b,80)[0];d.logicalBlockSize=both16(b,128)[0];
+      d.pathTableSize=both32(b,132)[0];d.lPathTable=both32(b,140)[0];d.mPathTable=both32(b,148)[1];
+      d.root={extent:both32(b,158)[0],size:both32(b,166)[0]};
+      d.publisher=ascii(b,318,128);d.preparer=ascii(b,446,128);d.application=ascii(b,574,128);
+      d.copyright=ascii(b,702,37);d.abstract=ascii(b,739,37);d.bibliographic=ascii(b,776,37);
+      d.creation=parseDate17(b,813);d.modification=parseDate17(b,830);d.expiration=parseDate17(b,847);d.effective=parseDate17(b,864);
+      d.raw=bytesHex(b.slice(0,2048));
+    }
+    if(type===2){
+      d.escape=ascii(b,88,32);d.systemId=ascii(b,8,32);d.volumeId=ascii(b,40,32);
+      d.logicalBlockSize=both16(b,128)[0];d.volumeSpace=both32(b,80)[0];
+      d.root={extent:both32(b,158)[0],size:both32(b,166)[0]};
+      if(b[88]===0x25&&b[89]===0x2f)d.joliet=true;
+      d.raw=bytesHex(b.slice(0,2048));
+    }
+    ds.push(d);
+    if(type===255){term=true;break}
+  }
+  return {descriptors:ds,terminated:term};
+}
+
+async function parsePathTable(pvd){
+  const size=pvd.pathTableSize,lba=pvd.lPathTable;
+  if(!size||!lba)return [];
+  const b=await readAt((iso.dataOffset||0)+lba*iso.sectorSize,size);
+  const out=[];let p=0,index=1;
+  while(p+8<=b.length){
+    const n=b[p], ext=b[p+1], extent=u32(b,p+2,true), parent=u16(b,p+6,true);
+    if(!n)break;
+    const name=dec.decode(b.slice(p+8,p+8+n));
+    out.push({index,name,extent,parent,extendedAttributeLength:ext});
+    p+=8+n+(n%2);index++;
+  }
+  return out;
+}
+
+async function parseElTorito(descs){
+  const boot=descs.descriptors.find(x=>x.type===0);
+  if(!boot||!boot.bootCatalogLba)return null;
+  const b=await readSector(boot.bootCatalogLba);
+  if(b[0]!==1||b[1]!==0)return {catalogLba:boot.bootCatalogLba,valid:false};
+  const out={catalogLba:boot.bootCatalogLba,valid:true,platformId:b[1],entries:[]};
+  for(let p=0;p+32<=b.length;p+=32){
+    const type=b[p],platform=b[p+1],indicator=b[p+0];
+    if(type===0x90||type===0x91||type===0x88||type===0x44||type===0x00){
+      const e={offset:p,type,platform,bootable:(type===0x88),media:b[p+1],loadSegment:u16(b,p+2,true),
+        sectorCount:u16(b,p+6,true),imageLba:u32(b,p+8,true)};
+      if(type===0x00&&p>0&&b[p+1]===0&&b[p+2]===0)continue;
+      out.entries.push(e);
+    }
+    if(type===0x91)break;
+  }
+  return out;
+}
+
+async function parseUdf(){
+  const total=Math.floor(iso.size/iso.sectorSize);
+  const candidates=[256,Math.max(0,total-256),Math.max(0,total-1)];
+  const anchors=[];
+  for(const lba of [...new Set(candidates)]){
+    if(lba>=total)continue;
+    const b=await readSector(lba), tag=u16(b,0,true);
+    if(tag===2)anchors.push({lba,tag,tagId:"Anchor Volume Descriptor Pointer",tagSerial:u16(b,16,true),
+      mainExtent:{length:u32(b,16+4,true),location:u32(b,16+8,true)},
+      reserveExtent:{length:u32(b,24+4,true),location:u32(b,24+8,true)}});
+  }
+  // Read the first sample area in ONE Blob.slice() operation.
+  // The old version performed up to 4096 individual async reads, which
+  // could make Edge appear frozen even for a small ISO.
+  const tags={};
+  const limit=Math.min(4096,total);
+  const sample=await readAt((iso.dataOffset||0),limit*iso.sectorSize);
+  for(let lba=0;lba<limit;lba++){
+    const p=lba*iso.sectorSize,tag=u16(sample,p,true);
+    if(tag)tags[tag]=(tags[tag]||0)+1;
+  }
+  return {detected:anchors.length>0,anchors,tagCounts:tags,sampleBlocks:limit};
+}
+
+async function analyze(){
+  const layout=await detectLayout();
+  if(!layout){
+    // Still perform UDF structural check before failing.
+    iso.sectorSize=2048;iso.dataOffset=0;
+    const udf=await parseUdf();
+    if(udf.detected) throw Error("UDF Anchorは検出しましたが、ISO9660のPVDがありません。この版ではUDFファイルツリー抽出は未実装です。");
+    throw Error("ISO9660 / 対応raw-sector配置を検出できませんでした。");
+  }
+  iso.sectorSize=layout.sectorSize;iso.dataOffset=layout.dataOffset;
+  const {descriptors}=await parseDescriptors();
+  const pvd=descriptors.find(x=>x.type===1);
+  if(!pvd)throw Error("Primary Volume Descriptorがありません");
+  const lb=pvd.logicalBlockSize;
+  if(lb!==iso.sectorSize) log(`PVD logical block=${lb}; physical=${iso.sectorSize}. PVD値を優先します`,"warn");
+  iso.sectorSize=lb;
+  const joliet=descriptors.find(x=>x.type===2&&x.joliet);
+  const path=await parsePathTable(pvd);
+  const eltorito=await parseElTorito(descriptors);
+  const udf=await parseUdf();
+  const root={name:"/",type:"dir",size:pvd.root.size,startLba:pvd.root.extent,sectors:Math.ceil(pvd.root.size/iso.sectorSize),parent:null,depth:0};
+  root.children=await parseDir(root.startLba,root.size,root,0);
+  fsInfo={layout,pvd,joliet,path,descriptors,eltorito,udf,root,
+    filesystem:joliet?"ISO9660 + Joliet":udf.detected?"ISO9660 + UDF metadata":"ISO9660"};
+  return fsInfo;
+}
+
+function flatten(nodes,out=[]){
+  for(const n of nodes){out.push(n);if(n.children)flatten(n.children,out)}return out;
+}
+function pathOf(n){
+  const a=[];let x=n;while(x&&x.parent){a.push(x.name);x=x.parent}return "/"+a.reverse().join("/");
+}
+function renderTree(){
+  const root=fsInfo.root;const el=$("tree");el.innerHTML="";
+  function add(n,host){
+    const d=document.createElement("div");d.className="node"+(n===selected?" sel":"");
+    d.textContent=(n.type==="dir"?"📁 ":"📄 ")+n.name;d.title=pathOf(n);
+    d.onclick=e=>{e.stopPropagation();selected=n;renderTree();renderRows();updateButtons()};
+    host.appendChild(d);
+    if(n.children){const sub=document.createElement("div");sub.className="indent";host.appendChild(sub);for(const c of n.children)add(c,sub)}
+  }
+  for(const n of root.children||[])add(n,el);
+}
+function renderRows(){
+  const tbody=$("rows");tbody.innerHTML="";
+  let arr=currentDir?.children||fsInfo.root.children||[];
+  if(!arr.length){
+    const tr=document.createElement("tr");
+    tr.innerHTML='<td colspan="5" class="small">このディレクトリには表示可能な項目がありません。</td>';
+    tbody.appendChild(tr);
+    return;
+  }
+  for(const n of arr){
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${esc(n.name)}</td><td>${n.type==="dir"?"Directory":"File"}</td><td class="num">${fmt(n.size)}</td><td class="num">${n.startLba}</td><td class="num">${n.sectors}</td>`;
+    tr.onclick=()=>{selected=n;renderTree();updateButtons()};
+    tr.ondblclick=()=>{if(n.type==="dir"){currentDir=n;renderRows();renderMeta()}};
+    tbody.appendChild(tr);
+  }
+}
+function renderMeta(){
+  if(!fsInfo)return;
+  const all=flatten(fsInfo.root.children||[]);
+  const files=all.filter(x=>x.type==="file"),dirs=all.filter(x=>x.type==="dir");
+  $("status").innerHTML=
+    `<b>${esc(iso.file.name)}</b> <span class="badge">${esc(fsInfo.filesystem)}</span><br>`+
+    `サイズ: ${fmt(iso.size)} / 論理ブロック: ${iso.sectorSize} / ISOブロック数: ${fsInfo.pvd.volumeSpace}<br>`+
+    `Volume ID: ${esc(fsInfo.pvd.volumeId||"-")} / ファイル: ${files.length} / ディレクトリ: ${dirs.length}`+
+    (fsInfo.joliet?` / Joliet: <span class="ok">検出</span>`:"")+
+    (fsInfo.eltorito?` / El Torito: <span class="ok">検出</span>`:"")+
+    (fsInfo.udf.detected?` / UDF Anchor: <span class="ok">検出</span>`:"");
+}
+function updateButtons(){const has=!!fsInfo; $("up").disabled=!has||!currentDir||!currentDir.parent;$("zipSel").disabled=!selected;$("zipAll").disabled=!has;$("analysis").disabled=!has}
+function setBusy(b){for(const id of ["open","up","zipSel","zipAll","analysis","clear"])$(id).disabled=b}
+async function openISO(file){
+  if(!file)return;
+  iso={file,size:file.size};
+  setBusy(true);$("rows").innerHTML="";$("tree").textContent="";selected=null;currentDir=null;$("log").textContent="";
+  log(`Opening: ${file.name} (${fmt(file.size)})`);
+  try{
+    $("status").textContent="ISOを解析中…（大容量ISOでも全体をRAMへ読み込みません）";
+    log("ISO9660構造を解析中…");
+    fsInfo=await analyze();
+    currentDir=fsInfo.root;
+    renderTree(); renderRows(); renderMeta();
+    log(`OK: ${flatten(fsInfo.root.children||[]).length} filesystem entries`,"ok");
+    log(`Layout: sector=${fsInfo.layout.sectorSize}, dataOffset=${fsInfo.layout.dataOffset}`);
+  }catch(e){fsInfo=null;currentDir=null;renderRows();updateButtons();$("status").innerHTML=`<span class="err">${esc(e.message||e)}</span>`;log(e.stack||e,"err")}
+  finally{setBusy(false);updateButtons()}
+}
+
+/* ---------------- CRC32 ---------------- */
+const CRC=new Uint32Array(256);
+(()=>{for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=(c&1)?(0xedb88320^(c>>>1)):(c>>>1);CRC[n]=c>>>0}})();
+function crcUpdate(crc,a){let c=(crc^0xffffffff)>>>0;for(const x of a)c=CRC[(c^x)&255]^(c>>>8);return (c^0xffffffff)>>>0}
+async function crcFile(n){
+  let crc=0xffffffff>>>0;
+  for(const e of n.extents){
+    let pos=0;
+    while(pos<e.size){
+      const take=Math.min(CHUNK,e.size-pos),b=await readAt((iso.dataOffset||0)+e.lba*iso.sectorSize+pos,take);
+      for(const x of b)crc=CRC[(crc^x)&255]^(crc>>>8);
+      pos+=take;
+    }
+  }
+  return (crc^0xffffffff)>>>0;
+}
+
+/* ---------------- ZIP64 helpers ---------------- */
+function w16(v){const a=new Uint8Array(2);new DataView(a.buffer).setUint16(0,v,true);return a}
+function w32(v){const a=new Uint8Array(4);new DataView(a.buffer).setUint32(0,Number(v)>>>0,true);return a}
+function w64(v){let x=BigInt(v),a=new Uint8Array(8),d=new DataView(a.buffer);d.setUint32(0,Number(x&0xffffffffn),true);d.setUint32(4,Number((x>>32n)&0xffffffffn),true);return a}
+function concat(...parts){let n=0;for(const p of parts)n+=p.length;const a=new Uint8Array(n);let o=0;for(const p of parts){a.set(p,o);o+=p.length}return a}
+function u8str(s){return new TextEncoder().encode(s)}
+function dosTime(){return {date:0x5b95,time:0}}
+function zipName(n){return pathOf(n).replace(/^\/+/,"")||"root"}
+function extraZip64(vals){
+  const payload=concat(...vals.map(w64)),h=concat(w16(1),w16(payload.length),payload);return h
+}
+async function makeZip(entries,label){
+  if(!entries.length)throw Error("ZIP対象がありません");
+  const stamp=Date.now(),parts=[],central=[],records=[];let offset=0n,index=0n;
+  log(`ZIP作成開始: ${entries.length} entries`);
+  for(const n of entries){
+    if(n.type!=="file")continue;
+    const name=u8str(zipName(n)),crc=await crcFile(n),size=BigInt(n.size);
+    const localExtra=extraZip64([size,size]);
+    const local=concat(w32(0x04034b50),w16(45),w16(0x0808),w16(0),w16(dosTime().time),w16(dosTime().date),
+      w32(crc),w32(0xffffffff),w32(0xffffffff),w16(name.length),w16(localExtra.length),name,localExtra);
+    parts.push(local);
+    for(const e of n.extents)for(let pos=0;pos<e.size;pos+=CHUNK){
+      const take=Math.min(CHUNK,e.size-pos);
+      parts.push(new Blob([iso.file.slice((iso.dataOffset||0)+e.lba*iso.sectorSize+pos,(iso.dataOffset||0)+e.lba*iso.sectorSize+pos+take)]));
+    }
+    const desc=w32(0x08074b50),dd=concat(desc,w32(crc),w32(0xffffffff),w32(0xffffffff));
+    parts.push(dd);
+    const cextra=extraZip64([size,size,offset]);
+    const c=concat(w32(0x02014b50),w16(45),w16(45),w16(0x0808),w16(0),w16(dosTime().time),w16(dosTime().date),
+      w32(crc),w32(0xffffffff),w32(0xffffffff),w16(name.length),w16(cextra.length),w16(0),w16(0),w16(0),w32(n.type==="dir"?0x10:0),w32(0xffffffff),name,cextra);
+    central.push(c);records.push({name:n.name,offset,size});offset+=BigInt(local.length)+size+12n;index++;
+    if(index%10n===0n)log(`  ${index} files...`);
+  }
+  const centralStart=offset,centralSize=central.reduce((s,x)=>s+BigInt(x.length),0n);
+  const zip64e=concat(w32(0x06064b50),w64(44n),w16(45),w16(45),w32(0),w32(0),w64(BigInt(central.length)),w64(centralSize),w64(centralStart));
+  const loc=concat(w32(0x07064b50),w32(0),w64(centralStart+centralSize),w32(1));
+  const eocd=concat(w32(0x06054b50),w16(0),w16(0),w16(0xffff),w16(0xffff),w32(0xffffffff),w32(0xffffffff),w16(0));
+  return {blob:new Blob([...parts,...central,zip64e,loc,eocd],{type:"application/zip"}),name:label,records};
+}
+async function saveBlob(blob,name){
+  if("showSaveFilePicker" in window){
+    try{
+      const h=await window.showSaveFilePicker({suggestedName:name,types:[{description:"ZIP archive",accept:{"application/zip":[".zip"]}}]});
+      const w=await h.createWritable();await w.write(blob);await w.close();log(`保存完了: ${name}`,"ok");return;
+    }catch(e){if(e.name==="AbortError")return;log(`直接保存失敗、通常ダウンロードへ: ${e.message}`,"warn")}
+  }
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),60000);
+}
+async function zipNodes(nodes,name){
+  const files=[];function collect(n){if(n.type==="file")files.push(n);else if(n.children)for(const c of n.children)collect(c)}
+  for(const n of nodes)collect(n);
+  if(!files.length)throw Error("ファイルがありません");
+  const z=await makeZip(files,name);await saveBlob(z.blob,name);
+}
+
+/* ---------------- Analysis ZIP ---------------- */
+function jsonBlob(x){return new Blob([JSON.stringify(x,null,2)],{type:"application/json"})}
+async function analysisZip(){
+  const a=[];
+  const summary={
+    tool:"ISO Explorer Edge Pro v3",file:iso.file.name,size:iso.size,
+    sectorSize:iso.sectorSize,dataOffset:iso.dataOffset,filesystem:fsInfo.filesystem,
+    volume:fsInfo.pvd,descriptorCount:fsInfo.descriptors.length,
+    entryCount:flatten(fsInfo.root.children||[]).length,generatedAt:new Date().toISOString()
+  };
+  a.push(["json/analysis_summary.json",jsonBlob(summary)]);
+  a.push(["json/iso9660_descriptors.json",jsonBlob(fsInfo.descriptors)]);
+  a.push(["json/iso9660_path_table.json",jsonBlob(fsInfo.path)]);
+  a.push(["json/eltorito.json",jsonBlob(fsInfo.eltorito)]);
+  a.push(["json/joliet.json",jsonBlob(fsInfo.joliet)]);
+  a.push(["json/udf_structure.json",jsonBlob(fsInfo.udf)]);
+  const sectorMap=flatten(fsInfo.root.children||[]).map(n=>({path:pathOf(n),type:n.type,size:n.size,startLba:n.startLba,sectors:n.sectors,extents:n.extents}));
+  a.push(["json/iso9660_sector_map.json",jsonBlob(sectorMap)]);
+  a.push(["json/rock_ridge.json",jsonBlob(flatten(fsInfo.root.children||[]).filter(n=>n.rr&&n.rr.entries.length).map(n=>({path:pathOf(n),rockRidge:n.rr})))]);
+  const raw16=await readSector(16);a.push(["raw/sector_16_pvd.bin",new Blob([raw16])]);
+  const vd=await readAt((iso.dataOffset||0)+16*iso.sectorSize,Math.min(32*iso.sectorSize,iso.size-(iso.dataOffset||0)-16*iso.sectorSize));
+  a.push(["raw/volume_descriptor_set_first_32_sectors.bin",new Blob([vd])]);
+  if(fsInfo.udf.anchors.length)a.push(["raw/udf_anchor_sector.bin",new Blob([await readSector(fsInfo.udf.anchors[0].lba)])]);
+  // Small ZIP STORE for analysis files; always well below 4GiB.
+  const files=a.map(([name,blob])=>({name,type:"file",size:blob.size,blob}));
+  let local=[],central=[],off=0;const now=dosTime();
+  for(const f of files){
+    const bytes=new Uint8Array(await f.blob.arrayBuffer()),crc=crcUpdate(0,bytes),name=u8str(f.name);
+    const lh=concat(w32(0x04034b50),w16(20),w16(0),w16(0),w16(now.time),w16(now.date),w32(crc),w32(bytes.length),w32(bytes.length),w16(name.length),w16(0),name);
+    local.push(new Blob([lh,bytes]));
+    const ch=concat(w32(0x02014b50),w16(20),w16(20),w16(0),w16(0),w16(now.time),w16(now.date),w32(crc),w32(bytes.length),w32(bytes.length),w16(name.length),w16(0),w16(0),w16(0),w16(0),w32(0),w32(off),name);
+    central.push(ch);off+=lh.length+bytes.length;
+  }
+  const cd=central.reduce((s,x)=>s+x.length,0);
+  const end=concat(w32(0x06054b50),w16(0),w16(0),w16(files.length),w16(files.length),w32(cd),w32(off),w16(0));
+  await saveBlob(new Blob([...local,...central,end],{type:"application/zip"}),iso.file.name.replace(/\.[^.]+$/,"")+"_analysis.zip");
+}
+
+/* ---------------- UI ---------------- */
+$("open").onclick=()=>$("file").click();
+$("file").onchange=e=>openISO(e.target.files[0]);
+$("clear").onclick=()=>{iso=fsInfo=currentDir=selected=null;$("tree").innerHTML="";$("rows").innerHTML="";$("status").textContent="ISOが読み込まれていません。";$("log").textContent="";updateButtons()};
+$("up").onclick=()=>{if(currentDir?.parent){currentDir=currentDir.parent;renderRows();renderMeta()}};
+$("zipSel").onclick=async()=>{try{setBusy(true);await zipNodes([selected],iso.file.name.replace(/\.[^.]+$/,"")+"_"+selected.name.replace(/[\\/:*?"<>|]/g,"_")+".zip")}catch(e){log(e.stack||e,"err")}finally{setBusy(false);updateButtons()}};
+$("zipAll").onclick=async()=>{try{setBusy(true);await zipNodes(fsInfo.root.children||[],iso.file.name.replace(/\.[^.]+$/,"")+"_contents.zip")}catch(e){log(e.stack||e,"err")}finally{setBusy(false);updateButtons()}};
+$("analysis").onclick=async()=>{try{setBusy(true);await analysisZip()}catch(e){log(e.stack||e,"err")}finally{setBusy(false);updateButtons()}};
+["dragenter","dragover"].forEach(ev=>$("drop").addEventListener(ev,e=>{e.preventDefault();$("drop").classList.add("over")}));
+["dragleave","drop"].forEach(ev=>$("drop").addEventListener(ev,e=>{e.preventDefault();$("drop").classList.remove("over")}));
+$("drop").addEventListener("drop",e=>openISO(e.dataTransfer.files[0]));
+updateButtons();
+</script>
+</body>
+</html>
