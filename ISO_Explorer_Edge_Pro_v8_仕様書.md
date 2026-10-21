@@ -1,4 +1,4 @@
-# ISO Explorer Edge Pro v8 — UDF 1.02～2.60 Advanced 仕様書
+# ISO Explorer Edge Pro
 
 **文書版:** 1.0  
 **対象:** `ISO_Explorer_Edge_Pro_v8_UDF_1.02-2.60_Advanced.html`  
