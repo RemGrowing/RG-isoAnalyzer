@@ -1,7 +1,5 @@
 # ISO Analyzer
 
-**文書版:** 1.0  
-**対象:** `ISO_Explorer_Edge_Pro_v8_UDF_1.02-2.60_Advanced.html`  
 **実行環境:** Microsoft Edge / Windows 11 / ローカルHTML  
 **基本方針:** 外部CDN・有料APIなし、ブラウザ内ローカル処理、大容量ISOを全量RAM展開しない
 
